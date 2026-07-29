@@ -470,6 +470,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "matplotlib" },
+    { name = "mnist1d" },
     { name = "numpy" },
     { name = "scikit-learn" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -501,6 +502,7 @@ requires-dist = [
     { name = "drfp", marker = "extra == 'paper'", specifier = ">=0.3" },
     { name = "faiss-cpu", marker = "extra == 'paper'", specifier = ">=1.8" },
     { name = "matplotlib", specifier = ">=3.7" },
+    { name = "mnist1d", specifier = ">=0.0.2.post1" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "opentsne", marker = "extra == 'paper'", specifier = ">=1.0" },
     { name = "pacmap", marker = "extra == 'paper'", specifier = ">=0.7" },
@@ -973,6 +975,22 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/ee/38/ceb1d637c4db6d06141f3739e93af3321e7caaabe69b57ae48ffe3ee95b1/matplotlib-3.11.1-pp311-pypy311_pp73-macosx_10_15_x86_64.whl", hash = "sha256:427258425f9a3fc4ed79a91f9e9b9aaf5a82cb6571e85dc14063cc6fbb993741", size = 9438045, upload-time = "2026-07-18T03:39:39.491Z" },
     { url = "https://files.pythonhosted.org/packages/89/25/72ad8b58602d3a6ef1dfc4b65ecd01634ab65a2bdf494c9fe0e966dbf081/matplotlib-3.11.1-pp311-pypy311_pp73-macosx_11_0_arm64.whl", hash = "sha256:1ac697e591c11b6ad04679a73c2d2f9980fe9d9f0311fb414a2e329706343dfb", size = 9266127, upload-time = "2026-07-18T03:39:41.597Z" },
     { url = "https://files.pythonhosted.org/packages/8a/6d/69552382fcc8e93d1f2763ef2665980a900a48b7f3a4c57ed290726d1cbc/matplotlib-3.11.1-pp311-pypy311_pp73-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:e4b9ac2f1f607ecda2af90a5232beee2af7582fce1cc30c4b6a1b012dc21ee99", size = 10019439, upload-time = "2026-07-18T03:39:43.78Z" },
+]
+
+[[package]]
+name = "mnist1d"
+version = "0.0.2.post1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "matplotlib" },
+    { name = "numpy" },
+    { name = "requests" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/69/34/b8551150c824b4738528bf82edb99a35d81c529c68a2e7e2cbe08b31b1ac/mnist1d-0.0.2.post1.tar.gz", hash = "sha256:e806fcefc9606b3d3a331c2db608740719f326e642b7606407a97488c7bdc13a", size = 280248, upload-time = "2024-05-20T18:13:34.172Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d0/22/3ffa6072425bab0c4b0e90667837df787a389626e3397dc0aafb986acdb4/mnist1d-0.0.2.post1-py3-none-any.whl", hash = "sha256:e780fadc12ab6e45994dcb02bbe728b347243e0a5d13790f2a86992500eceb86", size = 14369, upload-time = "2024-05-20T18:13:32.741Z" },
 ]
 
 [[package]]

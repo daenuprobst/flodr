@@ -131,7 +131,6 @@ def _fit_y_gmm(Y, ks=(16, 32, 64, 128, 256), seed=0):
     for k in ks:
         if k >= len(tr_idx):
             continue
-
         gmm = GaussianMixture(
             k, covariance_type="diag", random_state=seed, reg_covar=1e-6
         ).fit(Y[tr_idx])

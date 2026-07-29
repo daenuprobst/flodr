@@ -267,6 +267,7 @@ def depth_fog(Y, elev=22.0, azim=-60.0, strength=0.9, gamma=2.4):
             np.sin(elev_r),
         ]
     )
+    print("view", view.shape, view)
     depth = (Y - Y.mean(0)) @ view  # signed distance along the line of sight
 
     near = (depth - depth.min()) / (

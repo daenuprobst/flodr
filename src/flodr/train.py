@@ -695,6 +695,7 @@ def train_flodr(
     eb_size = min(cfg.edge_batch, n_edges) if cfg.edge_batch else 0
 
     for it in range(cfg.iters):
+        print(f"iteration {it + 1}/{cfg.iters}...", end="\n", flush=True)
         ramp = (
             1.0
             if cfg.warmup_frac <= 0
