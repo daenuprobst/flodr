@@ -14,6 +14,7 @@ dependencies = [
     "torch>=2.1",
     "usearch>=2.25.3",
     "typing-extensions>=4.15",
+    "tqdm>=4.66",
 ]
 
 [project.optional-dependencies]
@@ -28,6 +29,17 @@ paper = [
     "pymde>=0.1",
     "faiss-cpu>=1.8",
     "drfp>=0.3",
+    # HNOCA: range-reads obsm out of the remote h5ad, then writes the rotating gif
+    "fsspec>=2024.2",
+    "aiohttp>=3.9",
+    "pillow>=10.0",
+]
+
+# examples/quickstart.ipynb
+notebook = [
+    "nbformat>=5.9",
+    "nbconvert>=7.0",
+    "ipykernel>=6.29",
 ]
 
 [build-system]

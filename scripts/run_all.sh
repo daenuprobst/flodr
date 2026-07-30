@@ -7,11 +7,11 @@ cd "$(dirname "$0")/.."
 PY=.venv/bin/python
 LOG=scripts/cache/pipeline.log
 mkdir -p scripts/cache
-echo "=== pipeline start $(date -Is) ===" | tee -a $LOG
+echo "pipeline start $(date -Is)" | tee -a $LOG
 
 stage () {                       # stage <name> <command...>
   local name=$1; shift
-  echo "--- $name $(date -Is) ---" | tee -a $LOG
+  echo "$name $(date -Is)" | tee -a $LOG
   if "$@" >> $LOG 2>&1; then
     echo "    $name OK" | tee -a $LOG
   else
@@ -40,4 +40,4 @@ for ds in bmarrow cerebellum plant; do
 done
 stage architecture    pdflatex -interaction=nonstopmode -output-directory=figures scripts/architecture.tex
 
-echo "=== pipeline done $(date -Is) ===" | tee -a $LOG
+echo "pipeline done $(date -Is)" | tee -a $LOG

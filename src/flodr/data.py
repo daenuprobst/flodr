@@ -3,10 +3,12 @@ import warnings
 import numpy as np
 from scipy.linalg import null_space
 from scipy.optimize import curve_fit
+from scipy.spatial import cKDTree
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import laplacian
 from scipy.sparse.linalg import eigsh
 from sklearn.decomposition import PCA
+from sklearn.neighbors import NearestNeighbors
 from usearch.index import Index
 
 warnings.filterwarnings("ignore")
@@ -91,9 +93,24 @@ def spectral_init(ei, ej, w, n, scale=1.0, seed=0):
     return (layout / (layout.std(0) + 1e-12) * scale).astype(np.float32)
 
 
-EXACT_KNN_MAX = (
-    50_000  # below this, brute force is both faster to trust and cheap enough
-)
+EXACT_KNN_MAX = 50_000
+
+
+def knn_query(Xref, Xq, k, metric="euclid"):
+    self_q = Xq is None
+
+    if metric == "jaccard":
+        nn = NearestNeighbors(n_neighbors=k + self_q, metric="jaccard").fit(
+            np.asarray(Xref, dtype=bool)
+        )
+        dist, idx = nn.kneighbors(None if self_q else np.asarray(Xq, dtype=bool))
+    else:
+        dist, idx = cKDTree(Xref).query(Xref if self_q else Xq, k=k + self_q)
+
+    if self_q:
+        dist, idx = dist[:, 1:], idx[:, 1:]
+
+    return np.asarray(dist, dtype=np.float64), np.asarray(idx, dtype=np.int64)
 
 
 def knn_search(Xp, k, exact=None):
@@ -104,8 +121,9 @@ def knn_search(Xp, k, exact=None):
         exact = n <= EXACT_KNN_MAX
 
     if exact:
-        try:  # faiss brute force: exact and deterministic
-            import faiss  # even multithreaded; usearch fallback if absent
+        try:
+            # exact and deterministic even multithreaded
+            import faiss
 
             index = faiss.IndexFlatL2(n_dim)
             index.add(X_f32)
@@ -120,24 +138,22 @@ def knn_search(Xp, k, exact=None):
 
     index = Index(ndim=n_dim, metric="l2sq", dtype="f32")
 
-    # single-thread pin is for HNSW nondeterminism; the exact path is thread-count-independent
-    # (verified bitwise-identical against threads=1) so it may use all cores
+    # HNSW is nondeterministic across threads, the exact path is not and may use all cores
     index.add(np.arange(n), X_f32, threads=1 if not exact else 0)
-    res = index.search(
-        X_f32, k + 1, threads=1 if not exact else 0, exact=exact
-    )  # k+1: drop self
+    res = index.search(X_f32, k + 1, threads=1 if not exact else 0, exact=exact)
     keys, dist2 = res.keys.astype(np.int64), res.distances.astype(np.float64)
 
     if exact:
-        # lexsort to canonical (distance, index) tie order: multithreaded exact search returns
-        # ties in nondeterministic order (0.03% of MNIST rows), flipping graph edges run-to-run
+        # canonical (distance, index) tie order, since multithreaded exact search returns ties
+        # in whatever order it finds them, which flips graph edges run-to-run
         order = np.lexsort((keys, dist2), axis=1)
         keys = np.take_along_axis(keys, order, axis=1)
         dist2 = np.take_along_axis(dist2, order, axis=1)
 
+    # push self last
     order = np.argsort(
         keys == np.arange(n)[:, None], axis=1, kind="stable"
-    )  # push self last
+    )
     keys = np.take_along_axis(keys, order, axis=1)[:, :k]
     dist2 = np.take_along_axis(dist2, order, axis=1)[:, :k]
 
@@ -171,7 +187,8 @@ def fuzzy_knn_graph(Xp, k, n_iter=64, precomputed=None, return_dist=False):
     rows = np.repeat(np.arange(n), k)
     A = coo_matrix((w_attr.ravel(), (rows, idx.ravel())), shape=(n, n)).tocsr()
     B = (A + A.T - A.multiply(A.T)).tocoo()
-    mask = B.row < B.col  # unique undirected edges
+    # unique undirected edges
+    mask = B.row < B.col
     out = (
         idx,
         B.row[mask].astype(np.int64),

@@ -1,19 +1,16 @@
-"""scRNA showpiece: the two class-coloured maps, then three lenses (differentiation axis,
-pairwise Shepard, R_NX) as one row per method. Reads the scrna_embed.py cache.
-
-Run: [DATASET=bmarrow|cerebellum|plant] .venv/bin/python scripts/fig_scrna_combined.py
-"""
 import os
 import sys
 import warnings
 
-warnings.filterwarnings("ignore")
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from scipy.spatial.distance import cdist
 from scipy.stats import linregress, spearmanr
+
+warnings.filterwarnings("ignore")
+matplotlib.use("Agg")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.dirname(HERE)
@@ -29,8 +26,10 @@ PROG_DEFAULT = {"bmarrow": "HSC/MPP and pro", "cerebellum": "cerebellar granule 
 CACHE = os.path.join(SCRIPTS, "cache", "scrna", f"{DATASET}.npz")
 FIG = os.path.join(ROOT, "figures", f"scrna_{DATASET}_combined")
 NPAIR = 60000
-NSUB = 6000                                  # cells for the O(n^2) co-ranking matrix
-FIGW = 6.9                                   # A4 text width with narrow margins
+# cells for the O(n^2) co-ranking matrix
+NSUB = 6000
+# A4 text width, narrow margins
+FIGW = 6.9
 
 
 def palette(ncat):
@@ -52,8 +51,6 @@ def rect_lims(Y, pad=0.03):
 
 
 def rnx_curve(Xs, Ys):
-    """R_NX(k) from the co-ranking matrix (Lee & Verleysen); 1 is perfect at that scale,
-    0 is random. Subsampled -- the matrix is O(n^2). AUC is log-weighted, as published."""
     def ranks(A):
         dist = np.sqrt(((A[:, None, :] - A[None, :, :]) ** 2).sum(-1))
         rank = np.empty(dist.shape, np.int32)
@@ -61,8 +58,10 @@ def rnx_curve(Xs, Ys):
         rank[np.arange(n_pts)[:, None], np.argsort(dist, axis=1)] = np.arange(n_pts)[None, :]
         return rank
     n = len(Xs)
-    rank_max = np.maximum(ranks(Xs), ranks(Ys)).ravel()  # pairs enter at max(rank_hi, rank_lo)
-    cum_pairs = np.cumsum(np.bincount(rank_max, minlength=n)[1:n])  # both ranks <= k
+    # a pair enters at its worse rank
+    rank_max = np.maximum(ranks(Xs), ranks(Ys)).ravel()
+    # both ranks <= k
+    cum_pairs = np.cumsum(np.bincount(rank_max, minlength=n)[1:n])
     ks = np.arange(1, n - 1)
     qnx = cum_pairs[: n - 2] / (n * ks)
     rnx = ((n - 1) * qnx - ks) / (n - 1 - ks)
@@ -72,8 +71,6 @@ def rnx_curve(Xs, Ys):
 
 def rnx_panel(ax, ks, own, other, own_name, other_name, own_auc, other_auc, color,
               top=None):
-    """One method's R_NX curve, the other faint behind it. Drawn to k = n/2: the (n-1-k)
-    denominator makes the last decade unstable."""
     half = len(ks) // 2
     ks, own, other = ks[:half], own[:half], other[:half]
     ax.semilogx(ks, other, lw=0.8, color="0.62", ls="--", zorder=2,
@@ -95,8 +92,6 @@ def rnx_panel(ax, ks, own, other, own_name, other_name, own_auc, other_auc, colo
 
 
 def corr_panel(ax, x, y, kind, xlabel, ylabel, top=None):
-    """Shepard panel, axes normalised to the 99.5th percentile so both methods share a
-    scale. Dotted line is identity, solid is the fit."""
     xn, yn = x / np.percentile(x, 99.5), y / np.percentile(y, 99.5)
     fit = linregress(xn, yn)
     rho = spearmanr(x, y).statistic
@@ -114,7 +109,7 @@ def corr_panel(ax, x, y, kind, xlabel, ylabel, top=None):
     ax.tick_params(labelsize=6)
     ax.set_xlabel(xlabel, fontsize=6.5, labelpad=1.5)
     ax.set_ylabel(ylabel, fontsize=6.5, labelpad=1.5)
-    # rho sits inside: a per-row title would collide once the rows are packed tight
+    # rho sits inside, since a per-row title collides once the rows are packed tight
     ax.text(0.04, 0.965, rf"$\rho={rho:.2f}$", transform=ax.transAxes, fontsize=7,
             va="top", ha="left",
             bbox=dict(boxstyle="round,pad=0.16", fc="white", ec="none", alpha=0.75))
@@ -137,7 +132,6 @@ def main():
 
     prog = os.environ.get("PROGENITOR") or PROG_DEFAULT.get(DATASET)
     if prog not in set(cats):
-        from scipy.spatial.distance import cdist
         prog = cats[cdist(centers, centers).mean(1).argmin()]
     axis = np.linalg.norm(pcs - centers[list(cats).index(prog)], axis=1)
     vlo, vhi = np.percentile(axis, [2, 98])
@@ -150,8 +144,8 @@ def main():
     tri = np.triu_indices(ncat, 1)
     cent_dist = np.linalg.norm(centers[tri[0]] - centers[tri[1]], axis=1)
     shuf = rng.permutation(n)
-    # cached: the co-ranking matrix is the only expensive part here. Both methods see the
-    # same cells.
+    # the co-ranking matrix is the only expensive part here, so it is cached, and both
+    # methods see the same cells
     rnx_path = os.path.join(os.path.dirname(CACHE), f"{DATASET}_rnx.npz")
     if os.path.exists(rnx_path):
         cached = np.load(rnx_path)
@@ -166,20 +160,24 @@ def main():
                             auc_flodr=auc_f, auc_umap=auc_u)
     print(f"  AUC R_NX: FloDR {auc['FloDR']:.3f}  UMAP {auc['UMAP']:.3f}", flush=True)
 
-    # cap the columns rather than the rows: with 22 cell types a 3-row legend needs 8
-    # columns and widens the whole figure past the text block
+    # cap the columns, not the rows. with 22 cell types a 3-row legend needs 8 columns
+    # and widens the whole figure past the text block
     ncol = min(6, ncat)
     nrows_leg = int(np.ceil(ncat / ncol))
     left, right, gapx = 0.075, 0.985, 0.012
     wspace, hspace = 0.34, 0.02
-    # laid out in inches so no square panel floats inside an oversized slot
+    # laid out in inches, so no square panel floats inside an oversized slot
     map_w_in = (right - left - gapx) / 2 * FIGW
     map_h_in = 0.82 * map_w_in
-    panel_in = (right - left) * FIGW / (3 + 2 * wspace)          # square analytics panel
+    # square analytics panel
+    panel_in = (right - left) * FIGW / (3 + 2 * wspace)
     legend_in = 0.15 * nrows_leg + 0.04
-    top_in, bot_in = 0.30, 0.06                                  # suptitle / x-label
-    gap_above_leg, gap_below_leg = 0.05, 0.34   # legend hugs its maps, sits clear of the row
-    analytics_in = 2 * panel_in + hspace * panel_in + 0.40       # + row titles and labels
+    # suptitle / x-label
+    top_in, bot_in = 0.30, 0.06
+    # legend hugs its maps, clear of the row
+    gap_above_leg, gap_below_leg = 0.05, 0.34
+    # + titles and labels
+    analytics_in = 2 * panel_in + hspace * panel_in + 0.40
     fig_h = (top_in + map_h_in + gap_above_leg + legend_in + gap_below_leg
              + analytics_in + bot_in)
     with plt.rc_context(viz.RC_PAPER):
@@ -243,13 +241,14 @@ def main():
                       "#D55E00" if name == "FloDR" else "#0072B2",
                       top="neighbourhood preservation" if row == 0 else None)
             ax_rnx.set_xlabel("neighbourhood size $k$", fontsize=6.5, labelpad=1.5)
-            if row == 0:                     # shared x with the row below: drop duplicate labels
+            # shares x with the row below
+            if row == 0:
                 for ax in (ax_shep, ax_rnx):
                     ax.set_xlabel("")
                     ax.set_xticklabels([])
         for ext in ("png", "pdf"):
             fig.savefig(f"{FIG}.{ext}", dpi=300, bbox_inches="tight")
-    print(f"-> wrote {FIG}.png / .pdf  (n={n:,}, progenitor={prog})", flush=True)
+    print(f"wrote {FIG}.png / .pdf  (n={n:,}, progenitor={prog})", flush=True)
 
 
 if __name__ == "__main__":

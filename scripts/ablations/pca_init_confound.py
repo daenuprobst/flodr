@@ -1,10 +1,3 @@
-"""PCA-initialisation confound ablation on paul15, FloDR's clearest global-structure win
-(CPD 0.709 vs PCA-2 0.497 vs UMAP 0.045). Only the whitened PCA head is rotated by a random
-orthogonal Q, so the layout starts at a random 2D plane of PCA-50 space while the input
-information, the knn graph, and the ordinal term's input-distance targets are unchanged.
-
-Run: [DEVICE=cuda] [SEEDS=0,1,2] .venv/bin/python scripts/ablations/pca_init_confound.py
-"""
 import os
 import sys
 import json
@@ -21,18 +14,17 @@ ROOT = os.path.dirname(SCRIPTS)
 sys.path.insert(0, os.path.join(ROOT, "src"))
 sys.path.insert(0, SCRIPTS)
 
-from datasets import PAPER                                    # noqa: E402
-from flodr.data import fuzzy_knn_graph                        # noqa: E402
-from flodr.train import raw_recipe, train_flodr              # noqa: E402
+from datasets import PAPER  # noqa: E402
+from flodr.data import fuzzy_knn_graph  # noqa: E402
+from flodr.train import default_device, raw_recipe, train_flodr  # noqa: E402
 
 K = 15
-DEVICE = os.environ.get("DEVICE", "cpu")
+DEVICE = os.environ.get("DEVICE") or default_device()
 SEEDS = tuple(int(s) for s in os.environ.get("SEEDS", "0,1,2").split(","))
 OUT = os.path.join(SCRIPTS, "cache", "pca_init_confound.json")
 
 
 def whitened_coords(X_raw):
-    """Reproduce evaluate.py's flow input: whitened PCA head + floored-whitened tail."""
     n_dim = X_raw.shape[1]
     pca = PCA(n_components=min(50, n_dim - 1), svd_solver="randomized", random_state=0).fit(X_raw)
     proj = pca.transform(X_raw)
@@ -50,7 +42,6 @@ def cpd(Y, pair_i, pair_j, d_targ):
 
 
 def rand_rotation(d, seed):
-    """A random orthogonal d x d matrix from the QR of a Gaussian, sign-fixed for determinism."""
     gauss = np.random.default_rng(seed).standard_normal((d, d))
     q, r = np.linalg.qr(gauss)
     return (q * np.sign(np.diag(r))).astype(np.float32)
@@ -73,13 +64,16 @@ def main():
     z_white, d_head = whitened_coords(X_raw)
     _, edge_i, edge_j, w_attr, _ = fuzzy_knn_graph(X_raw, K, return_dist=True)
 
-    rng = np.random.default_rng(1000)                         # identical to evaluate.py
+    # the pair sampling of the removed benchmark evaluator, so these CPDs are
+    # comparable to the paper table
+    rng = np.random.default_rng(1000)
     pair_i, pair_j = rng.integers(0, n, 1_200_000), rng.integers(0, n, 1_200_000)
-    mask = (pair_i != pair_j) & (((pair_i + pair_j) % 5) == 0)  # held out from the ordinal term
+    # held out from training
+    mask = (pair_i != pair_j) & (((pair_i + pair_j) % 5) == 0)
     pair_i, pair_j = pair_i[mask][:300_000], pair_j[mask][:300_000]
     d_targ = np.linalg.norm(X_raw[pair_i] - X_raw[pair_j], axis=1)
 
-    # linear reference: PCA-2 is the initialisation the confound is about
+    # PCA-2 is the initialisation the confound is about
     pca2 = PCA(n_components=2, svd_solver="randomized", random_state=0).fit_transform(X_raw)
     cpd_pca2 = cpd(pca2, pair_i, pair_j, d_targ)
     print(f"\nPCA-2 (the initialisation)         CPD {cpd_pca2:.3f}", flush=True)
@@ -88,13 +82,14 @@ def main():
     rows = {"pca_init": [], "rand_init": []}
     for seed in SEEDS:
         t0 = time.perf_counter()
-        # unchanged: layout starts at top-2 PCs
+        # starts at top-2 PCs
         Y_pca, _ = fit(z_white, edge_i, edge_j, w_attr, X_raw, seed)
         cpd_p = cpd(Y_pca, pair_i, pair_j, d_targ)
 
-        Q = rand_rotation(d_head, 1000 + seed)                # rotate only the whitened head
+        # only the whitened head
+        Q = rand_rotation(d_head, 1000 + seed)
         z_rot = np.hstack([z_white[:, :d_head] @ Q.T, z_white[:, d_head:]]).astype(np.float32)
-        # layout starts at a random 2D plane
+        # random 2D plane
         Y_rand, _ = fit(z_rot, edge_i, edge_j, w_attr, X_raw, seed)
         cpd_r = cpd(Y_rand, pair_i, pair_j, d_targ)
 
@@ -119,7 +114,7 @@ def main():
                "pca_init_mean": mean_p, "pca_init_sd": sd_p,
                "rand_init_mean": mean_r, "rand_init_sd": sd_r},
               open(OUT, "w"), indent=1)
-    print(f"-> {OUT}", flush=True)
+    print(f"wrote {OUT}", flush=True)
 
 
 if __name__ == "__main__":

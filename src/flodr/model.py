@@ -32,16 +32,17 @@ def graph_loop(iters, draw, body, dev, warmup=3):
             with torch.cuda.graph(graph):
                 body()
 
-            graph.replay()  # capture records without executing
-
+            # the capture recorded without executing
+            graph.replay()
             done += 1
             for _ in range(iters - done):
                 draw()
                 graph.replay()
 
             return
+        # capture unsupported, finish eagerly
         except RuntimeError:
-            pass  # capture unsupported: finish eagerly
+            pass
 
     for _ in range(iters - done):
         draw()
@@ -66,13 +67,13 @@ class Coupling(torch.nn.Module):
         self.gate_max = float(gate_max)
         d_out = 2 * d
 
-        # fixed sketch conditioner: condition on a k-dim random projection of the masked dims.
-        # A coupling stays invertible for any function of the conditioning set.
+        # condition on a fixed random projection of the masked dims, since a coupling stays
+        # invertible for any function of the conditioning set
         use_sketch = bool(sketch) and d > sketch
         sketch_m = torch.randn(sketch, d) / d**0.5 if use_sketch else None
 
-        # sketch_head>0: zero the sketch's tail columns so the conditioner reads only the PCA
-        # head, starving the null-space per-point fingerprint (candidate out-of-sample collapse)
+        # zeroing the tail columns leaves the conditioner reading only the PCA head,
+        # which starves the null-space per-point fingerprint
         if sketch_m is not None and sketch_head:
             sketch_m[:, sketch_head:] = 0.0
 
@@ -87,7 +88,8 @@ class Coupling(torch.nn.Module):
             torch.nn.Linear(d_in, hid), act_cls(), *mid, torch.nn.Linear(hid, d_out)
         )
 
-        with torch.no_grad():  # near-identity init: zero the head
+        # zero the head for a near-identity init
+        with torch.no_grad():
             self.net[-1].weight.mul_(0.0)
             self.net[-1].bias.mul_(0.0)
 
@@ -167,7 +169,8 @@ class CondBase(torch.nn.Module):
             torch.nn.Linear(hid, 2 * (d - k)),
         )
 
-        with torch.no_grad():  # start at the unconditional standard normal
+        # start at the unconditional standard normal
+        with torch.no_grad():
             self.net[-1].weight.mul_(0.0)
             self.net[-1].bias.mul_(0.0)
 
@@ -189,11 +192,14 @@ class CondBase(torch.nn.Module):
     def y_log_prob(self, y):
         l2pi = math.log(2 * math.pi)
 
-        if getattr(self, "ylogw", None) is not None:  # fitted GMM (preferred)
-            diff = y[:, None, :] - self.ymu[None, :, :]  # (n, K, k)
+        # fitted GMM
+        if getattr(self, "ylogw", None) is not None:
+            # (n, K, k)
+            diff = y[:, None, :] - self.ymu[None, :, :]
+            # (n, K)
             log_p = -0.5 * (
                 diff**2 * torch.exp(-self.ylogvar[None]) + self.ylogvar[None] + l2pi
-            ).sum(2)  # (n, K)
+            ).sum(2)
 
             return torch.logsumexp(self.ylogw[None] + log_p, dim=1)
 
@@ -242,28 +248,26 @@ class Flow(torch.nn.Module):
             )
 
         self.layers = torch.nn.ModuleList(layers)
-        self.tail = (
-            torch.nn.ModuleList()
-        )  # y-conditioned density couplings (fit_cond_tail)
+        # y-conditioned couplings, see fit_cond_tail
+        self.tail = torch.nn.ModuleList()
 
-        self._cond = None  # CondBase, set by fit_cond_tail
-        self._density_args = None  # set by train_flodr for lazy density fitting
+        # CondBase, set by fit_cond_tail
+        self._cond = None
+        # set by train_flodr for lazy density fitting
+        self._density_args = None
         self.base_logvar = torch.nn.Parameter(torch.zeros(d))
         self.d, self.hid, self.k = d, hid, k
 
-        for name in (
-            "gmm_logw",
-            "gmm_W",
-            "gmm_muW",
-            "gmm_logdet",
-        ):  # set by fit_gmm_base
+        # fit_gmm_base
+        for name in ("gmm_logw", "gmm_W", "gmm_muW", "gmm_logdet"):
             self.register_buffer(name, None)
 
     def forward(self, x):
         for layer in self.layers:
             x = layer(x)
 
-        for layer in self.tail:  # identity on dims 0-1: embedding unchanged
+        # identity on dims 0-1, embedding unchanged
+        for layer in self.tail:
             x = layer(x)
 
         return x
@@ -322,10 +326,10 @@ class Flow(torch.nn.Module):
         dev = self.base_logvar.device
 
         if _latents is not None:
-            z_main, ld_main = _latents  # precomputed by fit_cond_tail_cv
+            z_main, ld_main = _latents
         else:
             with torch.no_grad():
-                # x may already be a device tensor; np.asarray on a cuda tensor raises
+                # x may already be a device tensor, and np.asarray raises on those
                 x_tens = x if torch.is_tensor(x) else torch.as_tensor(np.asarray(x))
                 z_main, ld_main = self.forward_with_logdet(
                     x_tens.to(device=dev, dtype=torch.float32)
@@ -337,7 +341,8 @@ class Flow(torch.nn.Module):
 
         for _ in range(n_tail):
             mask = torch.zeros(d)
-            mask[:k] = 1.0  # y always in the conditioning (identity) set
+            # y always in the conditioning (identity) set
+            mask[:k] = 1.0
             mask[k + torch.randperm(d - k)[: (d - k) // 2]] = 1.0
             tail.append(Coupling(d, mask, self.hid))
 
@@ -378,7 +383,8 @@ class Flow(torch.nn.Module):
             torch.nn.utils.clip_grad_norm_(params, 5.0)
             opt.step()
 
-        stack = torch.enable_grad()  # lazy fit may run inside a caller's no_grad
+        # the lazy fit may run inside a caller's no_grad
+        stack = torch.enable_grad()
         stack.__enter__()
         graph_loop(iters, draw, body, dev)
         stack.__exit__(None, None, None)
@@ -386,9 +392,9 @@ class Flow(torch.nn.Module):
         self._cond = cond
         self._density_args = None
 
-        # fit the GMM p(y) so the default density knows where the data is; the single Gaussian
-        # is not usable for this. The main flow is already frozen.
-        if _ydensity is not None:  # precomputed by fit_cond_tail_cv
+        # p(y) as a GMM, so the density knows where the data is. a single Gaussian will
+        # not do. The main flow is frozen by now.
+        if _ydensity is not None:
             for name, val in zip(("ylogw", "ymu", "ylogvar"), _ydensity):
                 cond.register_buffer(name, val.to(dev))
         else:
@@ -430,8 +436,8 @@ class Flow(torch.nn.Module):
             device=dev,
         )
 
-        # candidates share the frozen main flow: compute the latents and p(y) GMM once
-        # (bitwise-identical to per-candidate recomputation)
+        # every candidate shares the frozen main flow, so the latents and the p(y) GMM are
+        # computed once, bitwise identical to recomputing them per candidate
         with torch.no_grad():
 
             def _main_latents(x_in):
@@ -451,10 +457,7 @@ class Flow(torch.nn.Module):
             n_tail, hid, iters, floor, w_decay = (tuple(cand) + (0.0, 0.0))[:5]
             cand_flow = copy.deepcopy(self)
             cand_flow._density_args = None
-            cand_flow.tail, cand_flow._cond = (
-                torch.nn.ModuleList(),
-                None,
-            )  # idempotent: strip any prior fit
+            cand_flow.tail, cand_flow._cond = torch.nn.ModuleList(), None
 
             cand_flow.fit_cond_tail(
                 x[tr_idx],
@@ -468,9 +471,8 @@ class Flow(torch.nn.Module):
                 _ydensity=y_gmm,
             )
 
-            with (
-                torch.no_grad()
-            ):  # tail-only forward, identical to cand_flow.log_prob(x[va_idx])
+            # tail-only forward, identical to cand_flow.log_prob(x[va_idx])
+            with torch.no_grad():
                 z, logdet = z_va.clone(), ld_va.clone()
                 for layer in cand_flow.tail:
                     z, ld_layer = layer.forward_logdet(z)
@@ -567,14 +569,16 @@ class Flow(torch.nn.Module):
             def prec_chol(cov):
                 chol = torch.linalg.cholesky(cov)
 
+                # precision = W W^T
                 return torch.linalg.solve_triangular(
                     chol, eye.expand(n_comp, d, d).contiguous(), upper=False
-                ).transpose(1, 2)  # precision = W W^T
+                ).transpose(1, 2)
 
             weights, means, cov = m_step(resp)
             lb = -torch.inf
 
-            for _ in range(max_iter):  # E-step; stop on lower-bound convergence
+            # E-step, stop on lower-bound convergence
+            for _ in range(max_iter):
                 w_chol = prec_chol(cov)
                 y = (
                     torch.einsum("nd,kde->kne", z, w_chol)
@@ -620,7 +624,8 @@ class Flow(torch.nn.Module):
         ).sum(1)
 
     def log_prob(self, x):
-        _ = self.cond  # deferred tail must exist before the forward pass
+        # the deferred tail has to exist before the forward pass
+        _ = self.cond
         z, logdet = self.forward_with_logdet(x)
 
         return self.base_log_prob(z) + logdet

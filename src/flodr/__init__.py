@@ -8,7 +8,14 @@ from .data import (
 )
 from .estimator import FloDR
 from .model import Coupling, Flow
-from .train import TrainConfig, native_bf16, perf_cores, raw_recipe, train_flodr
+from .train import (
+    TrainConfig,
+    default_device,
+    native_bf16,
+    perf_cores,
+    raw_recipe,
+    train_flodr,
+)
 from . import viz
 
 __all__ = [
@@ -18,6 +25,7 @@ __all__ = [
     "TrainConfig",
     "train_flodr",
     "raw_recipe",
+    "default_device",
     "native_bf16",
     "perf_cores",
     "preprocess",

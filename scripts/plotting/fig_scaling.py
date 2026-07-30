@@ -1,18 +1,11 @@
-"""Speed and memory against n, from cache/scaling.json.
-
-Left  wall clock. Right  the method's own peak RSS above the loaded input, with FloDR's
-GPU reservation drawn separately. Points stop where a method died, and the failure is
-marked at the size that killed it.
-
-Run: .venv/bin/python scripts/fig_scaling.py
-"""
 import json
 import os
 import sys
 
 import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+matplotlib.use("Agg")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.dirname(HERE)
@@ -23,8 +16,8 @@ from flodr import viz  # noqa: E402
 CACHE = os.path.join(SCRIPTS, "cache", "scaling.json")
 FIG = os.path.join(ROOT, "figures", "scaling")
 STYLE = {
-    # full-batch FloDR is deliberately not drawn: it dies at 5e5 and its OOM marker
-    # dominated the panel. The failure is reported in the text instead.
+    # full-batch FloDR is left out on purpose, it dies at 5e5 and its OOM marker took
+    # over the panel, so the failure is reported in the text instead
     "flodr_eb": ("FloDR (GPU)", "#D55E00", "o", 2.2),
     "umap": ("UMAP", "#009E73", "s", 1.1),
     "opentsne": ("openTSNE", "#0072B2", "o", 1.1),
@@ -63,7 +56,7 @@ def main():
                 ns = [rec["n"] for rec in ok]
                 axes[0].loglog(ns, [rec["secs"] for rec in ok], **kw)
                 axes[1].loglog(ns, [max(rec["fit_mb"], 1) for rec in ok], **kw)
-                # GPU gets its own axis: host RSS and device memory are different
+                # GPU gets its own axis. Host RSS and device memory are different
                 # quantities, and the CUDA runtime puts a flat ~1.6GB floor under every
                 # torch method's RSS that has nothing to do with n
                 gpu = [rec for rec in ok if "gpu_mb" in rec]
@@ -93,7 +86,7 @@ def main():
         fig.tight_layout(w_pad=1.6)
         for ext in ("png", "pdf"):
             fig.savefig(f"{FIG}.{ext}", dpi=300, bbox_inches="tight")
-    print(f"-> {FIG}.png / .pdf", flush=True)
+    print(f"wrote {FIG}.png / .pdf", flush=True)
 
     print("\nfailures:")
     for rec in sorted(res.values(), key=lambda rec: (rec["method"], rec["n"])):
@@ -104,7 +97,6 @@ def main():
 
 
 def batched_table():
-    """paper/batched_table.tex: full batch against edge batched, from cache/batched.json."""
     path = os.path.join(SCRIPTS, "cache", "batched.json")
     if not os.path.exists(path):
         return
@@ -138,7 +130,7 @@ def batched_table():
     out = os.path.join(ROOT, "tables", "batched_table.tex")
     os.makedirs(os.path.dirname(out), exist_ok=True)
     open(out, "w").write(tex)
-    print(f"-> {out}", flush=True)
+    print(f"wrote {out}", flush=True)
 
 
 if __name__ == "__main__":

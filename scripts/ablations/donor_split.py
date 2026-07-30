@@ -1,11 +1,3 @@
-"""Donor-held-out generalisation for single-cell atlases: per rep the first
-ceil(n_donors/5) donors of a default_rng(20_000 + rep) permutation are fully held out
-(random cell splits overstate generalisation for scRNA-seq, since cells from one donor
-are near-duplicates). FloDR vs UMAP, metrics on held-out cells only (recall@15, CPD);
-results cached per (atlas, method, rep).
-
-Run: .venv/bin/python scripts/ablations/donor_split.py
-"""
 import json
 import math
 import os
@@ -22,7 +14,7 @@ SCRIPTS = os.path.dirname(HERE)
 ROOT = os.path.dirname(SCRIPTS)
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
-from flodr import FloDR                                      # noqa: E402
+from flodr import FloDR  # noqa: E402
 
 CACHE = os.path.join(SCRIPTS, "cache")
 OUT = os.path.join(CACHE, "donor_split.json")
@@ -35,9 +27,6 @@ TRANSFORM_CHUNK = 20_000
 
 
 def preprocess(atlas):
-    """normalize_total(1e4), log1p, 2000 HVGs, scale(max_value=10), PCA-50
-    (svd_solver="randomized", random_state=0), per-feature standardisation.
-    Cached to npz: it is identical across reps."""
     npz = os.path.join(CACHE, f"donor_split_preproc_{atlas}.npz")
     if os.path.exists(npz):
         data = np.load(npz, allow_pickle=True)
@@ -70,14 +59,13 @@ def donor_split(donors, rep):
 
 
 def knn15(X, query):
-    """Indices of the 15 nearest among X for each query row, self excluded. Euclidean."""
     import faiss
 
     X = np.ascontiguousarray(X, dtype=np.float32)
     index = faiss.IndexFlatL2(X.shape[1])
     index.add(X)
     _, nbrs = index.search(np.ascontiguousarray(query, dtype=np.float32), 16)
-    # the query row itself is in X; faiss returns it at distance 0, not always first on ties
+    # the query row is in X at distance 0, but not always first when there are ties
     row_idx = np.arange(len(query))[:, None]
     keep = nbrs != row_idx
     out = np.empty((len(query), 15), dtype=np.int64)
@@ -144,7 +132,8 @@ def run_cell(atlas, method, rep, P, train_mask, test_mask):
 
     emb_train = model.embedding_.astype(np.float32)
     emb_all = np.concatenate([emb_train, emb_test])
-    P_all = np.concatenate([X_train, X_test])  # same row order as emb_all
+    # same row order as emb_all
+    P_all = np.concatenate([X_train, X_test])
     assert P_all.shape[0] == emb_all.shape[0]
     test_rows = np.arange(len(emb_train), len(emb_all))
     return {
@@ -176,7 +165,7 @@ def main():
                 json.dump(res, open(OUT, "w"), indent=1)
                 print(f"[{key}] {result}", flush=True)
 
-    print("\n=== summary (mean +/- std over reps) ===")
+    print("\nsummary (mean +/- std over reps)")
     for atlas in ("bmarrow", "cerebellum"):
         for method in ("flodr", "umap"):
             cells = [res[f"{atlas}/{method}/{rep}"] for rep in REPS]

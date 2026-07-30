@@ -1,9 +1,3 @@
-"""Diagnostics figure: class map, spread sigma(y), hidden contrast h(y) = I(G;R|Y=y), and a
-shuffled null row per atlas, from the hidden_contrast.py caches (one fit per dataset, no
-refit). Each panel carries its own certificate verdict; a refused panel says so.
-
-Run: .venv/bin/python scripts/plotting/fig_diagnostics_fields.py
-"""
 import ast
 import json
 import os
@@ -11,10 +5,12 @@ import re
 import sys
 
 import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.colors import LinearSegmentedColormap, Normalize
+from scipy.spatial import cKDTree
+
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
-from matplotlib.colors import LinearSegmentedColormap, Normalize  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.dirname(HERE)
@@ -27,15 +23,11 @@ from flodr import viz  # noqa: E402
 CACHE = os.path.join(SCRIPTS, "cache")
 FIG = os.path.join(ROOT, "figures")
 
-# Sequential grey -> deep red for the hidden contrast, which is a magnitude with a meaningful
-# zero. The knots are placed rather than evenly spaced: chroma stays near-neutral through the
-# lower half and the saturated reds are held back past 0.8, so a field that is mostly small
-# reads as mostly quiet. An evenly spaced version reached strong red by the midpoint and made
-# every panel look like an alarm. Lightness stays strictly monotonic (checked below), so it
-# survives greyscale and never prints two values at one lightness.
-# The floor is a definite grey rather than near-white: at #f4f4f4 the low end and the empty
-# page were the same colour, so a quiet field read as no field and the null row looked blank
-# instead of looking measured-and-small.
+# Sequential grey to deep red, for a magnitude with a meaningful zero. The knots are
+# placed rather than evenly spaced, chroma stays near-neutral in the lower half and
+# the saturated reds are held back past 0.8, so a mostly small field reads as mostly
+# quiet. Lightness is strictly monotonic, so it survives greyscale. The floor is a
+# definite grey rather than near-white, or a quiet field reads as no field at all.
 GREY_RED = LinearSegmentedColormap.from_list("grey_red", [
     (0.00, "#dcdcdc"), (0.28, "#d4c6c0"), (0.50, "#ccae9f"),
     (0.70, "#c4886f"), (0.85, "#b64c33"), (0.94, "#8b190c"), (1.00, "#4d0300")])
@@ -47,7 +39,6 @@ SETS = [("bmarrow", "Human fetal bone marrow"),
 
 
 def wash(ax, Y, v, norm, cmap, res=560):
-    from scipy.spatial import cKDTree
     lo = Y.min(0) - 0.03 * np.ptp(Y, 0)
     hi = Y.max(0) + 0.03 * np.ptp(Y, 0)
     grid_x, grid_y = np.meshgrid(np.linspace(lo[0], hi[0], res),
@@ -59,7 +50,8 @@ def wash(ax, Y, v, norm, cmap, res=560):
     ax.imshow(v[nbr].mean(1).reshape(res, res), origin="lower",
               extent=(lo[0], hi[0], lo[1], hi[1]), cmap=cmap, norm=norm,
               alpha=alpha, interpolation="bilinear", zorder=1)
-    ctr, half = 0.5 * (lo + hi), 0.5 * float(np.max(hi - lo))   # square the DATA window
+    # square the data window
+    ctr, half = 0.5 * (lo + hi), 0.5 * float(np.max(hi - lo))
     ax.set_xlim(ctr[0] - half, ctr[0] + half)
     ax.set_ylim(ctr[1] - half, ctr[1] + half)
     ax.set_xticks([]); ax.set_yticks([]); ax.set_aspect("equal", adjustable="box")
@@ -68,16 +60,15 @@ def wash(ax, Y, v, norm, cmap, res=560):
 
 
 def parse_cert(v):
-    """Certificates were once written with str(dict); numpy 2 reprs scalars as np.float64(x),
-    which literal_eval rejects. Read JSON first, else strip the wrappers and retry."""
     text = str(v)
     try:
         return json.loads(text)
     except Exception:
         pass
-    text = re.sub(r"np\.True_", "True", text)          # numpy bools repr without parentheses,
-    text = re.sub(r"np\.False_", "False", text)        # and only appear on a REFUSED verdict,
-    text = re.sub(r"np\.\w+\(([^()]*)\)", r"\1", text)  # so this branch matters most
+    # np.True_ and np.False_ repr without parentheses, unlike the numeric scalars
+    text = re.sub(r"np\.True_", "True", text)
+    text = re.sub(r"np\.False_", "False", text)
+    text = re.sub(r"np\.\w+\(([^()]*)\)", r"\1", text)
     return ast.literal_eval(text)
 
 
@@ -101,10 +92,10 @@ def main():
     hid_max = max(float(np.percentile(npz["field"], 99)) for _, _, npz in have)
     sig_max = max(float(np.percentile(npz["sigma"], 99)) for _, _, npz in have)
     sig_min = min(float(np.percentile(npz["sigma"], 1)) for _, _, npz in have)
-    # sequential, sharing the hidden contrast's grey->red ramp so red means "more" in both rows.
-    # sigma has a natural zero but never approaches it (per-atlas minima 1.3 to 4.0), so the ramp
-    # runs from the pooled 1st percentile rather than from zero, which would waste its lower half
-    # and wash every panel pale. Pooled bounds keep the three atlases comparable to each other.
+    # sigma shares the hidden contrast's ramp, so red means "more" in both rows. It has a
+    # natural zero but never approaches it, so the ramp starts at the pooled 1st
+    # percentile, since from zero it would waste its lower half and wash every panel pale.
+    # Pooled bounds keep the three atlases comparable to each other.
     hid_norm = Normalize(0.0, hid_max)
     sig_norm = Normalize(sig_min, sig_max)
 
@@ -123,8 +114,8 @@ def main():
             sig_cert = parse_cert(npz["sigma_cert"])
             left = col * (panel_w + gap_x) / fig_w
 
-            # the map itself, for reference. tab20 matches the other scRNA figures; with no
-            # legend the hues mark grouping, not identity.
+            # the map itself, for reference. tab20 matches the other scRNA figures, and
+            # with no legend the hues mark grouping rather than identity
             ax = fig.add_axes([left, row_y[0], panel_w / fig_w, panel_w / fig_h])
             labs = np.asarray(npz["labels"]).astype(str)
             cats = np.unique(labs)
@@ -153,8 +144,8 @@ def main():
 
             ax = fig.add_axes([left, row_y[2], panel_w / fig_w, panel_w / fig_h])
             wash(ax, emb, np.asarray(npz["field"], float), hid_norm, CMAP)
-            # the FIELD's mean, which is what the caption promises; mean_gap is the raw
-            # validation-fold gap the certificate tests and is a slightly different quantity
+            # the field's mean, which is what the caption promises. mean_gap is the raw
+            # validation-fold gap the certificate tests, a slightly different quantity
             note(ax, [f"{np.asarray(npz['field'], float).mean():.2f} nats hidden",
                       (f"certified, $p$ = {hid_cert.get('p_level'):.2f}" if hid_cert.get("passed")
                        else "refused")], OK if hid_cert.get("passed") else BAD)
@@ -170,9 +161,9 @@ def main():
                              fontsize=7.0, rotation=90, va="center", ha="right")
 
         cbar_x = (n_atlas * panel_w + (n_atlas - 1) * gap_x + pad) / fig_w
-        # both bars one panel tall. The spread bar sits beside its single row; the contrast bar
-        # serves rows 3 and 4 and is centred on the pair rather than stretched over both, which
-        # otherwise reads as a taller scale carrying more range than it does.
+        # both bars one panel tall. The spread bar sits beside its single row, and the
+        # contrast bar serves rows 3 and 4 and is centred on the pair rather than
+        # stretched, which would read as a taller scale carrying more range than it does
         for bot, norm, cmap, label in (
                 (row_y[1], sig_norm, CMAP, r"$\sigma(y)$  (input units)"),
                 (row_y[3] + 0.5 * (panel_w + gap_y) / fig_h, hid_norm, CMAP,
@@ -187,7 +178,7 @@ def main():
             fig.savefig(os.path.join(FIG, f"diagnostics.{ext}"), dpi=300,
                         bbox_inches="tight", pad_inches=0.01)
         plt.close(fig)
-    print("-> figures/diagnostics.png / .pdf", flush=True)
+    print("wrote figures/diagnostics.png / .pdf", flush=True)
 
 
 if __name__ == "__main__":

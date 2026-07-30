@@ -1,7 +1,3 @@
-"""Benchmark datasets: PAPER maps name -> loader returning (X, labels, title, space note);
-TOY holds the synthetics used for the diagnostics controls. Add a dataset by adding a
-loader plus one registry line; the benchmark then computes only the missing rows.
-"""
 import io
 import os
 import urllib.request
@@ -47,8 +43,6 @@ def get_fmnist():
 
 
 def get_paul15():
-    """scanpy's standard pipeline: normalise, log1p, HVG-1000, scale, PCA-50 -- what
-    practitioners feed UMAP. The PCA step is denoising, not compression."""
     import scanpy as sc
     sc.settings.verbosity = 0
     adata = sc.datasets.paul15()
@@ -65,9 +59,6 @@ def get_paul15():
 
 
 def get_drfp():
-    """Schneider 50k reactions encoded with DRFP, stratified to N_CAP by superclass.
-    Measured in JACCARD: Spearman(Euclid, Jaccard) is 0.068 on this fingerprint, so the
-    Euclidean geometry is all but unrelated to reaction similarity."""
     import pandas as pd
     from drfp import DrfpEncoder
     npz = f"{CACHE}/drfp_schneider50k.npz"
@@ -90,17 +81,15 @@ def get_drfp():
 
 
 PAPER = {"mnist": get_mnist, "fmnist": get_fmnist, "paul15": get_paul15, "drfp": get_drfp}
-# the metric the field reads for each row; everything else is Euclidean
+# everything else is Euclidean
 METRIC = {"drfp": "jaccard"}
-# methods that cannot consume a non-Euclidean metric: fitted in Euclidean, scored in the
-# row's metric. Reported, not hidden.
+# these cannot consume a non-Euclidean metric, fitted in Euclidean and scored in
+# the metric the row is measured in
 EUCLID_ONLY = ("TriMap", "PaCMAP", "PCA-2", "LocalMAP", "PHATE", "PyMDE", "PCUMAP",
                "SQuadMDS")
 
 
-# synthetics for the diagnostics controls
 def make_ring(n=6000, d_noise=16, seed=0, r_lo=0.5, r_hi=3.0, noise=0.02):
-    """Thin-circle fibers over a 2D uniform base; radius varies 6x. Returns (X, truth)."""
     rng = np.random.default_rng(seed)
     base = rng.uniform(-4, 4, (n, 2)).astype(np.float64)
     radius = r_lo + (r_hi - r_lo) * (base[:, 0] + 4) / 8
@@ -113,10 +102,6 @@ def make_ring(n=6000, d_noise=16, seed=0, r_lo=0.5, r_hi=3.0, noise=0.02):
 
 def make_hetero(n=6000, k=8, d_fiber=28, seed=0, s_lo=0.1, s_hi=3.0, sep=9.0,
                 base_noise=0.6):
-    """Clustered synthetic, per-cluster spread spanning 30x. Returns (X, truth, labels).
-    truth is the fiber-only spread sigma*sqrt(d_fiber); with base_noise small the display
-    resolves the base and the total conditional spread approaches it (see
-    ablations/synthetic_validation.py)."""
     rng = np.random.default_rng(seed)
     labels = rng.integers(0, k, n)
     angles = 2 * np.pi * np.arange(k) / k
@@ -129,28 +114,17 @@ def make_hetero(n=6000, k=8, d_fiber=28, seed=0, s_lo=0.1, s_hi=3.0, sep=9.0,
 
 
 def make_blob(n=6000, d=30, seed=0):
-    """Isotropic Gaussian: flat true fields; the noise control."""
     return np.random.default_rng(seed).normal(0, 1.0, (n, d)).astype(np.float32)
 
 
 def make_hidden(n=6000, d_fiber=28, lam=0.0, seed=0, sep_base=4.0, s_fiber=(0.7, 1.5),
                 u_noise=1.0):
-    """Binary contrast split between a displayable base and a hidden fiber by lam in [0, 1].
-
-    g ~ Bernoulli(1/2); u = (1-lam)*C[g] + N(0, u_noise^2 I_2) with C = (+-sep_base/2, 0);
-    f ~ N(0, s(g,lam)^2 I_df) with s^2 interpolating 1 -> s_fiber[g]^2. lam=0: the base
-    separates the classes and the fiber is label-free, so nothing is hidden. lam=1: the
-    base is pure noise and the contrast lives only in the fiber scale. Whether the layout
-    can show that is empirical (a norm-shell difference is, in principle, displayable), so
-    the validation measures the leak with an oracle classifier on the embedding rather than
-    assuming it away -- the ground truth is I(G;X) - I(G;Y), not I(G;X). Returns
-    (X, u, g, truth); truth carries the generator parameters for hidden_truth().
-    """
     rng = np.random.default_rng(seed)
     C = np.array([[-sep_base / 2, 0.0], [sep_base / 2, 0.0]])
     g = rng.integers(0, 2, n)
     u = (1 - lam) * C[g] + rng.normal(0, u_noise, (n, 2))
-    s2 = 1.0 + lam * (np.asarray(s_fiber, float) ** 2 - 1.0)      # per-class fiber variance
+    # per-class variance
+    s2 = 1.0 + lam * (np.asarray(s_fiber, float) ** 2 - 1.0)
     f = rng.normal(0, 1.0, (n, d_fiber)) * np.sqrt(s2[g])[:, None]
     X = np.concatenate([u, f], 1).astype(np.float32)
     var_mat = np.repeat(s2[:, None], d_fiber, axis=1)
@@ -159,7 +133,6 @@ def make_hidden(n=6000, d_fiber=28, lam=0.0, seed=0, sep_base=4.0, s_fiber=(0.7,
 
 
 def _post_ll(u, f, truth):
-    """(n, 2) unnormalised log posteriors log p(u|g) [+ log p(f|g) if f is given]."""
     C, var_mat = truth["C"], truth["V"]
     mu = (1 - truth["lam"]) * C
     ll = -0.5 * ((u[:, None, :] - mu[None]) ** 2).sum(-1) / truth.get("u_noise", 1.0) ** 2
@@ -169,20 +142,18 @@ def _post_ll(u, f, truth):
 
 
 def hidden_truth(u, truth, n_mc=512, seed=0):
-    """h_true(u) = I(G ; X | U=u), nats, at each row of u: H(G|u) in closed form (two-class
-    Gaussian posterior) minus E_{f|u}[H(G|u,f)], with f drawn from the posterior's own class
-    covariance. MC error < 0.005 nats at n_mc=512. This is the ground truth the
-    hidden-contrast field should read wherever the display shows u and nothing more.
-    """
     var_mat = truth["V"]
     ll_u = _post_ll(u, None, truth)
     lu = ll_u - ll_u.max(1, keepdims=True)
-    post = np.exp(lu); post /= post.sum(1, keepdims=True)         # p(g|u)
+    # p(g|u)
+    post = np.exp(lu); post /= post.sum(1, keepdims=True)
     H_u = -(post * np.log(np.maximum(post, 1e-300))).sum(1)
     rng = np.random.default_rng(seed)
     ent_acc = np.zeros(len(u))
-    for _ in range(n_mc):                                         # E_{f|u} H(G|u,f), chunked
-        cls = (rng.random(len(u)) >= post[:, 0]).astype(int)      # g ~ p(g|u)
+    # E_{f|u} H(G|u,f)
+    for _ in range(n_mc):
+        # g ~ p(g|u)
+        cls = (rng.random(len(u)) >= post[:, 0]).astype(int)
         f = rng.normal(0, 1.0, (len(u), var_mat.shape[1])) * np.sqrt(var_mat[cls])
         ll = _post_ll(u, f, truth)
         ll -= ll.max(1, keepdims=True)
@@ -192,7 +163,6 @@ def hidden_truth(u, truth, n_mc=512, seed=0):
 
 
 def hidden_total_mi(truth, n_mc=200_000, seed=0):
-    """(I(G;u), I(G;X)) in nats under the generator, Monte Carlo with closed-form posteriors."""
     C, var_mat, d_fiber = truth["C"], truth["V"], truth["d_fiber"]
     lam = truth["lam"]
     rng = np.random.default_rng(seed)
@@ -230,7 +200,6 @@ ALL = {**PAPER, **TOY}
 
 
 def load_mnist(n=20000, seed=0):
-    """Raw MNIST at the size the diagnostics figures use (not globally standardised)."""
     return _openml("mnist_784", n=n, seed=seed)
 
 
@@ -239,17 +208,10 @@ def _ds_mnist20k():
     return X, y, "MNIST", "raw pixels, n=20000"
 
 
-# registry for the toy-scale benchmark that backs the local-global plane figure
 DATASETS = {"mnist": _ds_mnist20k, "hetero": _toy_hetero, "ring": _toy_ring,
             "swiss": _toy_swiss}
 
 
-def fit_flodr(X, seed=0, w=2.0, device="cuda", density=True, gate_max=0.5):
-    """Fit with the pipeline defaults: density on and the coupling log-scale bounded.
-
-    gate_max=0.5 is what takes sigma's certificate from refused to certified (level 6.6x ->
-    1.45x on bmarrow) and collapses the seed-to-seed spread of recall, at no measurable cost
-    in recall or CPD over five seeds. Pass gate_max=0 for the unbounded behaviour.
-    """
+def fit_flodr(X, seed=0, w=2.0, device=None, density=True, gate_max=0.5):
     return FloDR(w=w, random_state=seed, device=device, density=density,
                  advanced=dict(gate_max=gate_max) if gate_max else None).fit(X)

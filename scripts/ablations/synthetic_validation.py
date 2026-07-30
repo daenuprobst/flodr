@@ -1,24 +1,13 @@
-"""Validate the two diagnostic fields against synthetic ground truth, three seeds per cell.
-
-Spread: conditional_spread on make_hetero with per-cluster spread ranges of 3/10/30/100x,
-on make_ring, and on the make_blob flat control; truth is the generator's per-point spread.
-Hidden: hidden_contrast on make_hidden for lam in {0, .25, .5, .75, 1}, plus a stressed
-layout (the fitted embedding with its rows permuted, which leaks none of the contrast by
-construction). The hidden truth is I(G;X) - I(G;Y): the leak I(G;Y) is measured with an
-oracle classifier on the embedding rather than assumed away, and the per-position truth
-field is hidden_truth. Writes cache/synthetic_validation.json and
-figures/synthetic_validation.pdf; finished cells are skipped unless RECOMPUTE=1.
-
-Run: [DEVICE=cuda] [RECOMPUTE=1] .venv/bin/python scripts/ablations/synthetic_validation.py
-"""
 import json
 import os
 import sys
 
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from scipy.stats import pearsonr, spearmanr
+
+matplotlib.use("Agg")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.dirname(HERE)
@@ -26,9 +15,9 @@ ROOT = os.path.dirname(SCRIPTS)
 sys.path.insert(0, os.path.join(ROOT, "src"))
 sys.path.insert(0, SCRIPTS)
 
-from datasets import make_blob, make_hetero, make_hidden, make_ring              # noqa: E402
-from datasets import hidden_total_mi, hidden_truth                              # noqa: E402
-from flodr import FloDR, viz                                                    # noqa: E402
+from datasets import make_blob, make_hetero, make_hidden, make_ring  # noqa: E402
+from datasets import hidden_total_mi, hidden_truth  # noqa: E402
+from flodr import FloDR, default_device, viz  # noqa: E402
 
 OUT = os.path.join(SCRIPTS, "cache", "synthetic_validation.json")
 PANEL1 = os.path.join(SCRIPTS, "cache", "synthetic_validation_30x.npz")
@@ -37,15 +26,10 @@ SEEDS = (0, 1, 2)
 RANGES = (3, 10, 30, 100)
 LAMS = (0.0, 0.25, 0.5, 0.75, 1.0)
 RECOMPUTE = os.environ.get("RECOMPUTE") == "1"
-DEVICE = os.environ.get("DEVICE")
-if DEVICE is None:
-    import torch
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = os.environ.get("DEVICE") or default_device()
 
 
 def lin_stats(est, truth):
-    """OLS slope (with intercept), Pearson and Spearman of est against truth, per point."""
-    from scipy.stats import pearsonr, spearmanr
     design = np.column_stack([truth, np.ones_like(truth)])
     slope = float(np.linalg.lstsq(design, est, rcond=None)[0][0])
     return slope, float(pearsonr(est, truth).statistic), \
@@ -53,7 +37,6 @@ def lin_stats(est, truth):
 
 
 def spread_seed(kind, spread_range, seed):
-    """One (condition, seed) spread cell: fit, estimate sigma(y), score against truth."""
     if kind == "hetero":
         X, truth, lab = make_hetero(seed=seed, s_lo=3.0 / spread_range, s_hi=3.0)
     elif kind == "ring":
@@ -83,8 +66,6 @@ def spread_seed(kind, spread_range, seed):
 
 
 def oracle_mi(m, view, g, seed, iters=3000):
-    """I(G;view) in nats: H(G) plus the held-out log p(true class) of the estimator's own
-    classifier head, fit on one half and scored on the other."""
     gi = np.unique(g, return_inverse=True)[1]
     n = len(gi)
     rng = np.random.default_rng(seed + 13)
@@ -98,8 +79,6 @@ def oracle_mi(m, view, g, seed, iters=3000):
 
 
 def hidden_seed(lam, stress, seed):
-    """One (lam, seed) hidden-contrast cell. The stress arm permutes the embedding rows of
-    the lam=1 fit, so the display carries the contrast neither locally nor globally."""
     X, u, g, truth = make_hidden(lam=lam, seed=seed)
     m = FloDR(w=2.0, random_state=seed, device=DEVICE, density=True).fit(X)
     if stress:
@@ -112,7 +91,6 @@ def hidden_seed(lam, stress, seed):
     mi_u_or = oracle_mi(m, u, g, seed)
     pear = spear = float("nan")
     if true_field.std() > 1e-12 and field.std() > 1e-12:
-        from scipy.stats import pearsonr, spearmanr
         pear = float(pearsonr(field, true_field).statistic)
         spear = float(spearmanr(field, true_field).statistic)
     mean_field = float(field.mean())
@@ -131,12 +109,12 @@ def mean_sd(vals):
 
 
 def aggregate(res):
-    """Seed means (and population sds) next to the per-seed cells, matching the shipped JSON."""
     for key, arm in res.items():
         cells = arm["per_seed"]
         arm["cert_passed"] = [c["cert_passed"] for c in cells]
         if arm["kind"] == "spread":
-            if "true_range" not in arm:     # ring/blob stay per-seed only, as shipped
+            # ring and blob stay per-seed only
+            if "true_range" not in arm:
                 continue
             for fld in ("slope", "pearson", "spearman", "median_ratio", "est_range"):
                 arm[fld] = mean_sd([c[fld] for c in cells])[0]
@@ -154,7 +132,6 @@ def aggregate(res):
 
 
 def make_figure(res):
-    """Three panels: est vs true spread at 30x, range tracking, hidden contrast vs truth."""
     z = np.load(PANEL1)
     est, truth, lab = z["est"], z["truth"], z["lab"]
     with plt.rc_context(viz.RC_PAPER):
@@ -209,7 +186,7 @@ def make_figure(res):
             fig.savefig(os.path.join(FIG, f"synthetic_validation.{ext}"), dpi=300,
                         bbox_inches="tight")
         plt.close(fig)
-    print(f"-> {FIG}/synthetic_validation.pdf / .png", flush=True)
+    print(f"wrote {FIG}/synthetic_validation.pdf / .png", flush=True)
 
 
 def main():
@@ -238,7 +215,7 @@ def main():
     res = aggregate(res)
     json.dump(res, open(OUT, "w"), indent=1)
     make_figure(res)
-    print(f"-> {OUT}", flush=True)
+    print(f"wrote {OUT}", flush=True)
 
 
 if __name__ == "__main__":

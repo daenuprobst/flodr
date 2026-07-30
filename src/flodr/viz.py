@@ -15,7 +15,7 @@ RC = {
     "savefig.facecolor": "white",
 }
 
-# publication style (NeurIPS-sized: 5.5in text width, serif)
+# NeurIPS-sized, 5.5in text width, serif
 RC_PAPER = {
     "font.size": 8,
     "axes.titlesize": 8,
@@ -138,8 +138,10 @@ def conditional_atypicality(flow, Z, to_input=None, n_samples=128, seed=0, chunk
                 flow, y_all[start : start + chunk], n_samples, gen, to_input
             )
             mu = samples.mean(0)
-            d_samp = np.sqrt(((samples - mu) ** 2).sum(2))  # (n_samples, m)
-            d_x = np.sqrt(((x[start : start + chunk] - mu) ** 2).sum(1))  # (m,)
+            # (n_samples, m)
+            d_samp = np.sqrt(((samples - mu) ** 2).sum(2))
+            # (m,)
+            d_x = np.sqrt(((x[start : start + chunk] - mu) ** 2).sum(1))
             out[start : start + chunk] = (d_samp < d_x).mean(0)
 
     return out
@@ -193,8 +195,9 @@ def plot_embedding(Y, labels=None, ax=None, cmap="tab10", s=6, title=None):
 
 
 BIVARIATE_SCHEMES = {
-    "accessible": ["#e7e7e3", "#2a78d6", "#e34948", "#4a3aa7"],  # CVD-validated
-    # biscale / bivariatechoropleth palettes, given as corners [low-low, high-x, high-y, high-both]
+    # corners are [low-low, high-x, high-y, high-both]
+    # CVD-validated
+    "accessible": ["#e7e7e3", "#2a78d6", "#e34948", "#4a3aa7"],
     "Bluegill": ["#d3d3d3", "#74a7a3", "#976020", "#534c19"],
     "BlueGold": ["#d3d3d3", "#488fb0", "#dea301", "#4c6e01"],
     "BlueOr": ["#d3d3d3", "#dd6a29", "#169dd0", "#174f28"],
@@ -267,12 +270,10 @@ def depth_fog(Y, elev=22.0, azim=-60.0, strength=0.9, gamma=2.4):
             np.sin(elev_r),
         ]
     )
-    depth = (Y - Y.mean(0)) @ view  # signed distance along the line of sight
-
-    near = (depth - depth.min()) / (
-        np.ptp(depth) + 1e-12
-    )  # 1 nearest the camera, 0 farthest
-
+    # signed distance along the line of sight
+    depth = (Y - Y.mean(0)) @ view
+    # 1 near camera, 0 far
+    near = (depth - depth.min()) / (np.ptp(depth) + 1e-12)
     weight = (1.0 - strength * (1.0 - near) ** gamma)[:, None]
 
     return np.argsort(depth), weight, near
@@ -326,7 +327,8 @@ def _bivar_mix(sx, sy, cols):
             1,
         )
 
-    grid = cols.reshape(3, 3, 3)  # [y, x, rgb]
+    # [y, x, rgb]
+    grid = cols.reshape(3, 3, 3)
 
     gx, gy = sx * 2, sy * 2
 
@@ -425,16 +427,14 @@ def bivariate_field(
     mode = "both" if x_pass and y_pass else "x" if x_pass else "y" if y_pass else "none"
     sev = {"both": np.maximum(sx, sy), "x": sx, "y": sy, "none": np.zeros(n)}[mode]
 
-    qx = (
-        _quantize(sx, steps) if steps and x_pass else sx
-    )  # a dropped axis stays 0, never
-    qy = (
-        _quantize(sy, steps) if steps and y_pass else sy
-    )  # quantised (that would read as top bin)
+    # a dropped axis stays 0 and is never quantised, which would read as the top bin
+    qx = _quantize(sx, steps) if steps and x_pass else sx
+    qy = _quantize(sy, steps) if steps and y_pass else sy
 
     col = _bivar_mix(qx, qy, cols)
 
-    if shade is not None:  # ambient-occlusion shading (per cell)
+    # per-cell ambient occlusion
+    if shade is not None:
         col = col * np.clip(np.asarray(shade, float), 0.0, 1.0)[:, None]
 
     if highlight is not None and mode != "none":
@@ -445,18 +445,19 @@ def bivariate_field(
         fade = np.clip((sev - low) / (thresh - low + 1e-9), 0, 1)[:, None]
         col = col * fade + np.array([0.93, 0.93, 0.92]) * (1 - fade)
 
-    order = np.argsort(sev)  # worst cells drawn last, on top
+    # worst cells drawn last, on top
+    order = np.argsort(sev)
 
     if threed:
         if ax is None:
             ax = plt.gcf().add_subplot(projection="3d")
 
-        if fog:  # atmospheric depth: fade the far tail to bg,
-            order, weight, near = depth_fog(
-                Y, elev, azim, fog_strength
-            )  # draw back-to-front, near cells bigger
+        # fade the far tail to background and draw back to front
+        if fog:
+            order, weight, near = depth_fog(Y, elev, azim, fog_strength)
             col = col * weight + np.array([1.0, 1.0, 1.0]) * (1 - weight)
-            size = s * (0.3 + 1.3 * near)  # steep size gradient reinforces depth
+            # a steep size gradient reinforces depth
+            size = s * (0.3 + 1.3 * near)
             ax.view_init(elev=elev, azim=azim)
         else:
             size = np.full(len(Y), float(s))
@@ -475,9 +476,8 @@ def bivariate_field(
         _bare3d(ax)
 
         if legend and mode != "none":
-            _bivar_key(
-                ax, mode, cols, steps, 0, xlabel, ylabel
-            )  # top-left: 3D bbox has no data-count
+            # top-left, since a 3D bbox gives no per-corner data count to pick from
+            _bivar_key(ax, mode, cols, steps, 0, xlabel, ylabel)
 
         return ax
 

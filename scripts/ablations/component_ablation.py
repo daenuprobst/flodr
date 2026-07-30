@@ -1,23 +1,12 @@
-"""Component ablations of FloDR on the paper benchmarks: one component varied per arm
-(flow depth, sketch conditioner, density NLL) against the reference recipe (w=2.0,
-gate_max=0.5, density off); cells are cached per dataset x arm x seed.
-
-Run: [DEVICE=cuda] [SEEDS=0,1,2] [DATASETS=mnist,fmnist,paul15,drfp] \
-     .venv/bin/python scripts/ablations/component_ablation.py
-"""
 import json
 import os
 import sys
 import time
 
 import numpy as np
+import torch
 from scipy.stats import spearmanr
 from sklearn.neighbors import NearestNeighbors
-
-import torch
-# each arm variant recompiles train_flodr's step(); the default limit of 8 is hit within
-# one process over the full arm x seed grid
-torch._dynamo.config.recompile_limit = 64
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.dirname(HERE)
@@ -25,8 +14,12 @@ ROOT = os.path.dirname(SCRIPTS)
 sys.path.insert(0, os.path.join(ROOT, "src"))
 sys.path.insert(0, SCRIPTS)
 
-from datasets import PAPER, METRIC                           # noqa: E402
-from flodr import FloDR                                      # noqa: E402
+from datasets import PAPER, METRIC  # noqa: E402
+from flodr import FloDR  # noqa: E402
+
+# every arm recompiles train_flodr's step(), and the full arm x seed grid blows through
+# the default limit of 8 inside one process
+torch._dynamo.config.recompile_limit = 64
 
 K = 15
 N_PAIR = 60_000
@@ -46,7 +39,6 @@ ARMS = {
 
 
 def knn_indices(A, k=K, metric="euclidean"):
-    """k nearest neighbours, self excluded, in the row's metric."""
     nn = NearestNeighbors(n_neighbors=k + 1, metric=metric).fit(A)
     return nn.kneighbors(A, return_distance=False)[:, 1:]
 
@@ -68,7 +60,6 @@ def eval_embedding(X, Y, metric, nn_x, pairs, d_in):
 
 
 def fit_arm(X, arm, seed):
-    """Fit one cell; on CUDA trouble (the GPU is shared) fall back to CPU and record it."""
     for device in (DEVICE, "cpu") if DEVICE != "cpu" else ("cpu",):
         try:
             t0 = time.perf_counter()
@@ -98,7 +89,7 @@ def main():
         X = np.asarray(PAPER[ds]()[0], np.float32)
         n, d = X.shape
         metric = METRIC.get(ds, "euclidean")
-        print(f"\n=== {ds}: n={n}, d={d}, metric={metric}, device={DEVICE} ===", flush=True)
+        print(f"\n{ds}: n={n}, d={d}, metric={metric}, device={DEVICE}", flush=True)
 
         nn_x = knn_indices(X, metric=metric)
         rng = np.random.default_rng(5)
@@ -111,7 +102,7 @@ def main():
         d_in = pair_dist(X, pair_i, pair_j, metric)
         pairs = (pair_i, pair_j)
 
-        # the sketch conditioner is meaningful only where d > 64 (paul15 has d=50)
+        # the sketch conditioner only means anything where d > 64, and paul15 has d=50
         arms = [a for a in ARMS if not (a == "nosketch" and d <= 64)]
         for arm in arms:
             cell = res.setdefault(ds, {}).setdefault(arm, {})
@@ -130,7 +121,7 @@ def main():
                     pass
                 json.dump(res, open(OUT, "w"), indent=1)
 
-        # mean/std over seeds, stored beside the per-seed cells
+        # mean/std over seeds, stored next to the per-seed cells
         for arm in arms:
             cell = res[ds][arm]
             done = [cell[str(s)] for s in SEEDS if str(s) in cell]
@@ -141,10 +132,9 @@ def main():
         json.dump(res, open(OUT, "w"), indent=1)
 
     total = time.perf_counter() - t0
-    print(f"\ntotal wall time {total/60:.1f} min (fits only per cell in 'secs')  -> {OUT}")
+    print(f"\ntotal wall time {total/60:.1f} min (fits only per cell in 'secs'), wrote {OUT}")
 
-    header = f"{'dataset':10s} {'arm':9s} {'recall@15':>15s} {'CPD':>15s} {'secs':>7s}"
-    print(f"\n{header}\n" + "-" * len(header))
+    print(f"\n{'dataset':10s} {'arm':9s} {'recall@15':>15s} {'CPD':>15s} {'secs':>7s}")
     for ds in DATASETS:
         if ds not in res:
             continue

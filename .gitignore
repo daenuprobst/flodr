@@ -221,5 +221,10 @@ __marimo__/
 
 paper/
 cache/
-figures/
 tables/
+
+data/
+
+figures/
+
+experiments/

@@ -1,23 +1,14 @@
-"""Main comparison figures and LaTeX table, from the cache/eval caches written by
-evaluate.py, so the figures can be retuned without recomputing anything.
-
-Layout: one row per method, one column per dataset; equal-aspect square panels are placed
-explicitly because constrained_layout would shrink them to the tightest cell. `main` draws
-FloDR (w=2, no ordinal), UMAP, openTSNE and the PCA-2 control; `appendix` the rest.
-The table carries every method regardless of which figure draws it.
-
-Run: [DATASETS=mnist,fmnist,paul15,drfp] .venv/bin/python scripts/fig_main_comparison.py
-"""
 import json
 import os
 import sys
 import warnings
 
-warnings.filterwarnings("ignore")
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+matplotlib.use("Agg")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.dirname(HERE)
@@ -35,7 +26,8 @@ ORDER = os.environ.get("DATASETS", "mnist,fmnist,paul15,drfp").split(",")
 
 MAIN = ["FloDR (w=2)", "FloDR (no ordinal)", "UMAP", "openTSNE", "PCA-2"]
 APPENDIX = ["TriMap", "PaCMAP", "LocalMAP", "PHATE", "PyMDE", "PCUMAP", "SQuadMDS"]
-METHODS = MAIN + APPENDIX                       # table order; every method is tabulated
+# table order, everything is tabulated
+METHODS = MAIN + APPENDIX
 SHORT = {"fmnist": "Fashion-MNIST", "paul15": "paul15 (scRNA)", "drfp": "Schneider 50k"}
 INK, GRID, ALERT = "#0b0b0b", "#e4e3df", "#c1442f"
 CLASS_CMAP = "tab10"
@@ -44,9 +36,10 @@ ALPHA = float(os.environ.get("ALPHA", "0.75"))
 
 
 def panel(ax, Y, labels):
-    lo, hi = np.percentile(Y, [0.5, 99.5], axis=0)        # robust frame, ignore stragglers
-    # square frame at equal aspect: one half-range for both axes, so panels are directly
-    # comparable in size and no layout is stretched to fill its cell
+    # robust frame, ignore outliers
+    lo, hi = np.percentile(Y, [0.5, 99.5], axis=0)
+    # one half-range for both axes, so panels stay comparable in size and no layout gets
+    # stretched to fill its cell
     center = (lo + hi) / 2
     half = 0.53 * (hi - lo).max()
     cmap = plt.get_cmap("tab20" if len(np.unique(labels)) > 10 else CLASS_CMAP)
@@ -61,11 +54,11 @@ def panel(ax, Y, labels):
 
 
 def draw(ds, meta, rows, stem):
-    """rows x ds panels, sized to sit on A4 portrait at 100% so point sizes are literal."""
     if not rows:
         return
     nrow, ncol = len(rows), len(ds)
-    LEFT, TOP, GAP = 0.60, 0.62, 0.05           # row labels, column headers, panel gap
+    # row labels, column headers, panel gap
+    LEFT, TOP, GAP = 0.60, 0.62, 0.05
     edge = min((6.69 - LEFT - GAP * (ncol - 1)) / ncol, (10.12 - TOP - GAP * (nrow - 1)) / nrow)
     fig_w = LEFT + ncol * edge + (ncol - 1) * GAP
     fig_h = TOP + nrow * edge + (nrow - 1) * GAP
@@ -83,8 +76,8 @@ def draw(ds, meta, rows, stem):
                 continue
             panel(ax, npz[mname], npz["labels"])
             ms = meta[d]["methods"][mname]["mean_std"]
-            # a method that cannot consume this row's metric is fit on Euclidean but scored
-            # against the metric the field reads: say so on the panel, not in a footnote
+            # a method that cannot consume this row's metric is fit on Euclidean and
+            # scored in the metric the field reads, so say so on the panel, not in a footnote
             blind = mname in meta[d].get("euclid_only", [])
             ax.text(0.03, 0.03, f"recall {ms['recall'][0]:.3f}\nglobal {ms['gspear'][0]:.3f}"
                     + ("\nEuclidean-only" if blind else ""),
@@ -98,8 +91,8 @@ def draw(ds, meta, rows, stem):
                              f"{meta[d]['space'].replace(' -> ', r'$\to$')}\n"
                              f"{'Jaccard' if met == 'jaccard' else 'Euclidean'}",
                              fontsize=7.0, linespacing=1.3)
-        # every FloDR arm is ours, not just the headline one; two lines because the variant
-        # alone would not fit along a ~1.2in panel edge as one string
+        # every FloDR arm is ours, not just the headline one. Two lines, because one
+        # string would not fit along a ~1.2in panel edge
         ours = mname.startswith("FloDR")
         label = f"FloDR (ours)\n{mname[7:-1]}" if ours else mname
         axes[row][0].set_ylabel(label, fontsize=7.4, fontweight="bold" if ours else "normal",
@@ -110,7 +103,7 @@ def draw(ds, meta, rows, stem):
     print(f"wrote {stem}.png / .pdf  ({nrow}x{ncol}, panel {edge:.2f}in)", flush=True)
 
 
-# hi=True -> higher is better. SNS is a stress: lower is better. hi=None -> never ranked.
+# True = higher is better, False = lower (SNS is a stress), None = never ranked
 FIELDS = [("recall", "recall@15", True), ("trust", "trust", True), ("cont", "cont.", True),
           ("gspear", r"CPD ($\rho$)", True), ("pearson", "Shepard $r$", True),
           ("sns", r"SNS $\downarrow$", False), ("centroid", "centroid", True),
@@ -129,7 +122,6 @@ def _vals(meta, d, fld, present):
 
 
 def _ranks(vals, higher):
-    """{method: rank}, 1 = best. Ties share the average rank."""
     order = sorted(vals, key=lambda mname: vals[mname], reverse=higher)
     ranks, i = {}, 0
     while i < len(order):
@@ -144,8 +136,6 @@ def _ranks(vals, higher):
 
 
 def _mark(inner, rank):
-    """Best bold, second underlined. `inner` is math content without the $ $ -- \\textbf is a
-    text-mode command and cannot reach material inside $ $, so it must be \\mathbf inside."""
     if rank == 1:
         return rf"$\mathbf{{{inner}}}$"
     if rank == 2:
@@ -165,15 +155,12 @@ def _name(mname, blind):
 
 
 def _notes(extra=()):
-    """Left-aligned notes: a bare \\footnotesize under \\centering comes out centred, the
-    minipage restores normal justification."""
     return ([r"  \vspace{3pt}", r"  \begin{minipage}{\textwidth}", r"  \footnotesize"]
             + list(extra) + [r"  \end{minipage}"])
 
 
 def write_latex(ds, meta, rows):
-    """booktabs table: best per column per dataset bold, second best underlined."""
-    lines = [r"% generated by scripts/fig_main_comparison.py -- do not hand-edit",
+    lines = [r"% generated by scripts/plotting/fig_main_comparison.py -- do not hand-edit",
              r"\begin{table*}[t]", r"  \centering",
              r"  \caption{FloDR against neighbour-embedding baselines and a linear control across four",
              r"    domains. Each dataset is measured in the metric its own field reads; all methods see",

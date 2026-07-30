@@ -1,21 +1,12 @@
-"""Held-out frontier figure (heldout_frontier.pdf), read from the scores written by
-heldout_score.py (cache/heldout_benchmark.json). Nothing here recomputes an embedding.
-
-Each panel is one dataset; x is held-out recall@15, y is held-out CPD, both scored on the
-held-out points only. The FloDR w-sweep {0, 1, 2, 3} is a connected curve (w annotated),
-the baselines' own transform procedures are single points. Error bars are std over the
-5 splits. Upper-right is better on both axes.
-
-Run: .venv/bin/python scripts/plotting/fig_heldout_frontier.py
-"""
 import json
 import os
 import sys
 
 import numpy as np
 import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+matplotlib.use("Agg")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPTS = os.path.dirname(HERE)
@@ -29,10 +20,10 @@ os.makedirs(FIG, exist_ok=True)
 
 DS = [("mnist", "MNIST"), ("fmnist", "Fashion-MNIST"), ("paul15", "paul15"),
       ("drfp", "Schneider 50k")]
-# (json key, legend label, w) in curve order; w=2 is the `flodr` arm of the benchmark
+# (json key, legend label, w) in curve order, where w=2 is the benchmark's `flodr` arm
 FLODR = [("flodr_w0", "FloDR", 0), ("flodr_w1", "FloDR", 1),
          ("flodr", "FloDR", 2), ("flodr_w3", "FloDR", 3)]
-# Okabe-Ito derived, same assignments as figures.py where the method appears there
+# Okabe-Ito derived, matching figures.py wherever a method appears in both
 BASE = [("opentsne", "openTSNE transform", "o", "#0072B2"),
         ("umap", "UMAP transform", "s", "#009E73"),
         ("parametric_umap", "Parametric UMAP", "P", "#E69F00"),

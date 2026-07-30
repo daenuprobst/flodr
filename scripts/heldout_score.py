@@ -1,12 +1,3 @@
-"""Scores the held-out embeddings produced by heldout_benchmark.py (no training here):
-test points only, against the full high-dimensional distance matrix (Euclidean, Jaccard
-for drfp; computed once per dataset, cached as scripts/cache/heldout_hd_{ds}.npy).
-Metrics: recall15 (2D/HD 15-NN overlap), trust15 (k=15), cpd (Spearman HD-vs-2D over
-20 partners per test point, rng seed 777 fixed across methods). Aggregates mean/std
-over reps per (dataset, method) into scripts/cache/heldout_benchmark.json. Idempotent.
-
-Usage: .venv/bin/python scripts/heldout_score.py
-"""
 import glob
 import json
 import os
@@ -25,16 +16,15 @@ K = 15
 N_PAIRS = 20
 PAIR_SEED = 777
 METHODS = ("flodr", "flodr_w0", "flodr_w1", "flodr_w3",
-           "umap", "opentsne", "pca2", "knnmap")             # preferred order
+           "flodr_opt", "flodr_optA", "optA_long",
+           "umap", "opentsne", "pca2", "knnmap")
 
 
 def method_order(found):
-    """Known methods first in METHODS order, then any extras alphabetically."""
     return [m for m in METHODS if m in found] + sorted(set(found) - set(METHODS))
 
 
 def hd_matrix(ds):
-    """Full (n, n) float32 input-distance matrix, cached on disk."""
     path = os.path.join(CACHE, f"heldout_hd_{ds}.npy")
     if os.path.exists(path):
         return np.load(path)
@@ -50,14 +40,12 @@ def hd_matrix(ds):
 
 
 def score_cell(D, Y_full, train_idx, test_idx):
-    """All three metrics for one (ds, method, rep). Scores test points only."""
     n, m = len(Y_full), len(test_idx)
 
     # 2D kNN of each test point among all n points, self excluded
     _, knn_2d = cKDTree(Y_full).query(Y_full[test_idx], k=K + 1)
     y_nn = np.array([row[row != i][:K] for row, i in zip(knn_2d, test_idx)])
 
-    # HD kNN and HD ranks, test rows only
     D_test = D[test_idx].astype(np.float32, copy=True)
     D_test[np.arange(m), test_idx] = np.inf
     hd_nn = np.argpartition(D_test, K, axis=1)[:, :K]
@@ -68,15 +56,18 @@ def score_cell(D, Y_full, train_idx, test_idx):
     recall = float(np.mean([len(np.intersect1d(row_2d, row_hd)) / K
                             for row_2d, row_hd in zip(y_nn, hd_nn)]))
 
-    nn_ranks = ranks[np.arange(m)[:, None], y_nn]        # HD rank of each 2D neighbour
+    # HD rank of each 2D neighbour
+    nn_ranks = ranks[np.arange(m)[:, None], y_nn]
     penalty = np.maximum(nn_ranks - K, 0).sum()
     trust = float(1.0 - 2.0 * penalty / (m * K * (2 * n - 3 * K - 1)))
 
-    rng = np.random.default_rng(PAIR_SEED)               # same pairs for every method
+    # same pairs for every method
+    rng = np.random.default_rng(PAIR_SEED)
     hd_dists, ld_dists = [], []
     for i in test_idx:
         partners = rng.integers(0, n - 1, N_PAIRS)
-        partners = partners + (partners >= i)            # uniform over all points != i
+        # uniform over points != i
+        partners = partners + (partners >= i)
         hd_dists.append(D[i, partners])
         ld_dists.append(np.linalg.norm(Y_full[i] - Y_full[partners], axis=1))
     cpd = float(spearmanr(np.concatenate(hd_dists), np.concatenate(ld_dists)).statistic)
@@ -118,9 +109,7 @@ def main():
         json.dump(out, f, indent=2, sort_keys=True)
 
     print(f"\nwrote {OUT}\n")
-    hdr = f"{'dataset':<10} {'method':<9} {'recall@15':>16} {'trust@15':>16} {'cpd':>16}"
-    print(hdr)
-    print("-" * len(hdr))
+    print(f"{'dataset':<10} {'method':<9} {'recall@15':>16} {'trust@15':>16} {'cpd':>16}")
     for ds in out:
         for method in method_order(out[ds]):
             stats = out[ds][method]

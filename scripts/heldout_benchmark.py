@@ -1,10 +1,4 @@
-"""Held-out (out-of-sample) embedding benchmark: FloDR.transform against the baselines'
-own transform procedures, on deterministic train/test splits of every PAPER dataset.
-Writes scripts/cache/heldout_embeds/*.npz (existing cells are skipped) and
-heldout_meta.json; scores are computed separately by heldout_score.py.
-
-Usage: .venv/bin/python scripts/heldout_benchmark.py
-"""
+import copy
 import json
 import os
 import time
@@ -15,6 +9,8 @@ from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
 
 from datasets import PAPER, METRIC
+from flodr import FloDR
+from flodr.data import find_ab, fuzzy_knn_graph
 
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
 EMBEDS = os.path.join(CACHE, "heldout_embeds")
@@ -29,21 +25,18 @@ try:
     import torch.func
     if not torch.cuda.is_available():
         DEVICE = "cpu"
-    # each fit compiles fresh closures; the default recompile limit (8) is exhausted by
-    # a full sweep in one process and fullgraph=True turns that into a hard failure
+    # every fit compiles fresh closures, and a full sweep in one process blows through
+    # the default limit of 8, which fullgraph=True turns into a hard failure
     torch._dynamo.config.cache_size_limit = 128
 except ImportError:
     torch = None
     DEVICE = "cpu"
 
-from flodr import FloDR
-from flodr.data import fuzzy_knn_graph
-
 
 def split(n, rep):
-    """The exact split every producer of heldout embeddings must use."""
     perm = np.random.default_rng(10_000 + rep).permutation(n)
-    return perm[n // 5:], perm[: n // 5]          # train_idx, test_idx
+    # train_idx, test_idx
+    return perm[n // 5:], perm[: n // 5]
 
 
 def load_meta():
@@ -89,7 +82,6 @@ def run_flodr(X_train, X_test, seed, device, w=2.0):
 
 
 def fit_flodr_safe(X_train, X_test, seed, w=2.0):
-    """Prefer cuda; on CUDA OOM (shared GPU) fall back to cpu."""
     try:
         return run_flodr(X_train, X_test, seed, DEVICE, w)
     except RuntimeError as e:
@@ -138,7 +130,6 @@ def run_pca2(X_train, X_test, seed, metric):
 
 
 def umap_train_embedding(ds, rep, X_train, X_test, train_idx, test_idx, metric, meta):
-    """The UMAP train embedding for this split, from cache or a fresh fit (cached)."""
     path = cell_path("umap", ds, rep)
     if os.path.exists(path):
         return np.load(path)["Y_train"]
@@ -149,15 +140,16 @@ def umap_train_embedding(ds, rep, X_train, X_test, train_idx, test_idx, metric, 
     return np.asarray(Y_train, np.float32)
 
 
-def run_knnmap(X_train, X_test, Y_train_umap, metric):
-    """15-NN of each test point among the train points in the input metric; the test
-    embedding is the inverse-distance weighted average of their UMAP positions."""
-    t0 = time.perf_counter()
+def knn_train(X_train, X_test, metric):
     if metric == "jaccard":
         nn = NearestNeighbors(n_neighbors=K_NN, metric="jaccard").fit(X_train.astype(bool))
-        dists, idx = nn.kneighbors(X_test.astype(bool))
-    else:
-        dists, idx = cKDTree(X_train).query(X_test, k=K_NN)
+        return nn.kneighbors(X_test.astype(bool))
+    return cKDTree(X_train).query(X_test, k=K_NN)
+
+
+def run_knnmap(X_train, X_test, Y_train_umap, metric):
+    t0 = time.perf_counter()
+    dists, idx = knn_train(X_train, X_test, metric)
     fit_secs = time.perf_counter() - t0
     t0 = time.perf_counter()
     weights = 1.0 / (dists + 1e-9)
@@ -167,9 +159,42 @@ def run_knnmap(X_train, X_test, Y_train_umap, metric):
     return Y_train_umap, Y_test, fit_secs, transform_secs
 
 
+# name -> (anchor cell, repulsion, steps, lr, datasets to restrict to or None)
+OPT_ARMS = {"flodr_opt": ("flodr", True, 200, 0.05, None),
+            "flodr_optA": ("flodr", False, 200, 0.05, None),
+            "optA_long": ("flodr", False, 500, 0.025, ("mnist", "fmnist"))}
+
+
+def run_transform_opt(Y_train, y0, nn_idx, seed, repulsion=True, steps=200, lr=0.05,
+                      n_neg=5):
+    a, b = find_ab(0.01)
+    dev = torch.device(DEVICE if torch is not None else "cpu")
+    Y_train_t = torch.from_numpy(np.ascontiguousarray(Y_train, np.float32)).to(dev)
+    y = torch.from_numpy(np.ascontiguousarray(y0, np.float32)).to(dev).requires_grad_(True)
+    # (m, 15)
+    nn_t = torch.from_numpy(np.asarray(nn_idx)).long().to(dev)
+    m = len(y)
+    gen = torch.Generator(device=dev).manual_seed(20_000 + seed)
+    opt = torch.optim.Adam([y], lr=lr)
+
+    def q(d2):
+        return 1.0 / (1.0 + a * (d2 + 1e-6) ** b)
+
+    for _ in range(steps):
+        # (m, 15)
+        d2 = ((y[:, None, :] - Y_train_t[nn_t]) ** 2).sum(-1)
+        loss = -torch.log(q(d2) + 1e-6).mean()
+        if repulsion:
+            neg = torch.randint(0, len(Y_train_t), (m, n_neg), device=dev, generator=gen)
+            d2n = ((y[:, None, :] - Y_train_t[neg]) ** 2).sum(-1)
+            loss = loss - torch.log(1.0 - q(d2n) + 1e-6).mean()
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+    return y.detach().cpu().numpy()
+
+
 def invertibility(est, X_train):
-    """Round-trip through the exact bijection: per-point relative L2 of
-    inverse_coords(_forward(X)) vs X. Returns (median, max)."""
     Z = est._forward(X_train)
     X_rec = est.inverse_coords(Z)
     num = np.linalg.norm(X_rec - X_train, axis=1)
@@ -179,9 +204,6 @@ def invertibility(est, X_train):
 
 
 def jacobian_diag(est, X_train, n_points=32, chunk=4):
-    """Condition number and log|det J| of the trained flow's forward, at n_points train
-    points in latent space. Chunked so at most `chunk` Jacobians (D x D each) are live.
-    Runs on the flow's device, falling back to a CPU copy on CUDA failure."""
     z = torch.from_numpy(est._to_coords(X_train[:n_points])).float()
     flow = est.flow_
 
@@ -191,7 +213,8 @@ def jacobian_diag(est, X_train, n_points=32, chunk=4):
         jac_fn = torch.func.vmap(torch.func.jacrev(fwd))
         kappas, logdets = [], []
         for start in range(0, len(z_), chunk):
-            J = jac_fn(z_[start:start + chunk])            # (b, D, D)
+            # (b, D, D)
+            J = jac_fn(z_[start:start + chunk])
             svals = torch.linalg.svdvals(J)
             kappas.append((svals[:, 0] / svals[:, -1]).cpu())
             logdets.append(torch.linalg.slogdet(J)[1].cpu())
@@ -204,7 +227,6 @@ def jacobian_diag(est, X_train, n_points=32, chunk=4):
     except RuntimeError as e:
         if device.type == "cpu" or "memory" not in str(e).lower():
             raise
-        import copy
         print(f"    jacobian on cuda failed ({e}); retrying on cpu", flush=True)
         torch.cuda.empty_cache()
         kappa, logdet = compute(copy.deepcopy(flow).cpu(), z)
@@ -228,7 +250,7 @@ def main():
             train_idx, test_idx = split(n, rep)
             X_train, X_test = X[train_idx], X[test_idx]
 
-            # fuzzy kNN graph timing, once per dataset (it lives inside FloDR.fit)
+            # time the fuzzy kNN graph once per dataset, since it lives inside FloDR.fit
             if rep == 0 and ds not in meta.get("fuzzy_knn_secs", {}):
                 t0 = time.perf_counter()
                 fuzzy_knn_graph(X_train, K_NN)
@@ -237,13 +259,29 @@ def main():
                 print(f"[{ds}] fuzzy kNN graph: {meta['fuzzy_knn_secs'][ds]}s", flush=True)
 
             for method in ("flodr", "flodr_w0", "flodr_w1", "flodr_w3",
-                           "umap", "opentsne", "pca2", "knnmap"):
+                           "umap", "opentsne", "pca2", "knnmap", *OPT_ARMS):
                 path = cell_path(method, ds, rep)
                 if os.path.exists(path):
                     print(f"[{ds} rep{rep}] {method}: cached, skip", flush=True)
                     continue
                 t_start = time.perf_counter()
-                if method.startswith("flodr"):
+                if method in OPT_ARMS:
+                    # placement against a cached FloDR cell's frozen train embedding,
+                    # initialised at that cell's forward pass, and never refits
+                    src, repu, stp, lr_, only = OPT_ARMS[method]
+                    if only and ds not in only:
+                        continue
+                    zf = np.load(cell_path(src, ds, rep))
+                    t0 = time.perf_counter()
+                    _, idx_nn = knn_train(X_train, X_test, metric)
+                    fit_secs = time.perf_counter() - t0
+                    t0 = time.perf_counter()
+                    Y_test = run_transform_opt(zf["Y_train"], zf["Y_test"], idx_nn,
+                                               seed=rep, repulsion=repu, steps=stp, lr=lr_)
+                    xform_secs = time.perf_counter() - t0
+                    save_cell(method, ds, rep, train_idx, test_idx, zf["Y_train"], Y_test)
+                    record_timing(meta, ds, method, rep, fit_secs, xform_secs)
+                elif method.startswith("flodr"):
                     w = float(method[7:]) if method.startswith("flodr_w") else 2.0
                     est, Y_train, Y_test, fit_secs, xform_secs = fit_flodr_safe(
                         X_train, X_test, rep, w)
@@ -279,7 +317,7 @@ def main():
                       f"{xform_secs:.2f}s (total {time.perf_counter() - t_start:.1f}s)",
                       flush=True)
 
-    # CPU-only FloDR fit timing, last: mnist train split of rep 0. May take tens of minutes.
+    # CPU-only fit timing, last because it can take tens of minutes
     if "flodr_cpu_fit_mnist_secs" not in meta:
         X = datasets["mnist"]
         train_idx, _ = split(len(X), 0)

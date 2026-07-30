@@ -4,9 +4,9 @@ import numpy as np
 import torch
 from scipy.spatial import cKDTree
 
-from .data import fuzzy_knn_graph, raw_coords
+from .data import find_ab, fuzzy_knn_graph, knn_query, raw_coords
 from .model import graph_loop
-from .train import raw_recipe, train_flodr
+from .train import default_device, raw_recipe, train_flodr
 from . import viz
 
 
@@ -15,7 +15,7 @@ class NotFittedError(ValueError):
 
 
 class FloDR:
-    # frozen at the recipe behind the paper's main comparison; not user knobs on purpose
+    # the recipe behind the paper's main comparison, deliberately not user knobs
     _FROZEN = dict(n_neighbors=15, pca_head=50, stress_ordinal=True)
 
     def __init__(
@@ -23,22 +23,20 @@ class FloDR:
         w=2.0,
         *,
         random_state=0,
-        device="cpu",
+        device=None,
         density=False,
         n_components=2,
         w_stress=None,
         advanced=None,
     ):
-        self.w = (
-            float(w_stress) if w_stress is not None else float(w)
-        )  # w_stress: legacy alias
+        self.w = float(w_stress) if w_stress is not None else float(w)
         self.random_state = random_state
-        self.device = device
+        self.device = default_device() if device is None else device
         self.density = density
         self.n_components = n_components
         self.advanced = dict(advanced or {})
 
-    # legacy alias, so existing callers keep working
+    # legacy alias
     @property
     def w_stress(self):
         return self.w
@@ -64,6 +62,8 @@ class FloDR:
         for k, v in kw.items():
             if k == "w_stress":
                 self.w = float(v)
+            elif k == "device":
+                self.device = default_device() if v is None else v
             elif k in (
                 "w",
                 "random_state",
@@ -74,7 +74,7 @@ class FloDR:
             ):
                 setattr(self, k, v)
             else:
-                self.advanced[k] = v  # unsupported, but do not silently drop it
+                self.advanced[k] = v
         return self
 
     @staticmethod
@@ -87,8 +87,11 @@ class FloDR:
             else "euclid"
         )
 
-    def _config(self, X):
+    def _config(self, X, iters=None):
         kw = dict(self.advanced)
+
+        if iters is not None:
+            kw.setdefault("iters", int(iters))
 
         if self.w:
             kw.update(
@@ -108,7 +111,7 @@ class FloDR:
         if not hasattr(self, "flow_"):
             raise NotFittedError("call fit first")
 
-    def fit(self, X, y=None):
+    def fit(self, X, y=None, iters=800, progress=True):
         if not (isinstance(self.n_components, int) and self.n_components >= 2):
             raise ValueError(
                 "n_components must be an int >= 2 (the embedding is the flow's first "
@@ -127,18 +130,27 @@ class FloDR:
                 f"({Z.shape[1]}); the residual needs at least one dim to stay invertible"
             )
 
-        self.knn_idx_, edge_i, edge_j, w_attr, self.knn_dist_ = fuzzy_knn_graph(
-            X, self._FROZEN["n_neighbors"], return_dist=True
+        self._metric = self._metric_for(X)
+        # on binary data the graph is built in Jaccard, like the stress term
+        pre = (
+            knn_query(X, None, self._FROZEN["n_neighbors"], "jaccard")
+            if self._metric == "jaccard"
+            else None
         )
+        self.knn_idx_, edge_i, edge_j, w_attr, self.knn_dist_ = fuzzy_knn_graph(
+            X, self._FROZEN["n_neighbors"], precomputed=pre, return_dist=True
+        )
+        self._cfg = self._config(X, iters)
         Y, roundtrip, _, flow = train_flodr(
             Z,
             edge_i,
             edge_j,
-            self._config(X),
+            self._cfg,
             np.random.default_rng(self.random_state),
             return_model=True,
             w=w_attr,
             stress_X=X,
+            progress=progress,
         )
 
         self.embedding_, self.roundtrip_, self.flow_ = (
@@ -148,11 +160,12 @@ class FloDR:
         )
 
         self._coords = Z
+        self._X = X
 
         return self
 
-    def fit_transform(self, X, y=None):
-        return self.fit(X).embedding_
+    def fit_transform(self, X, y=None, iters=800, progress=True):
+        return self.fit(X, iters=iters, progress=progress).embedding_
 
     def _forward(self, X):
         z_new = self._to_coords(np.asarray(X, dtype=np.float32))
@@ -164,6 +177,29 @@ class FloDR:
     def transform(self, X):
         self._check()
         return self._forward(X)[:, : self.n_components].cpu().numpy()
+
+    def transform_opt(self, X, steps=200, lr=0.05):
+        self._check()
+        X = np.asarray(X, dtype=np.float32)
+        _, nn = knn_query(self._X, X, self._FROZEN["n_neighbors"], self._metric)
+        a, b = find_ab(self._cfg.min_dist)
+        dev = next(self.flow_.parameters()).device
+        Ytr = torch.from_numpy(np.ascontiguousarray(self.embedding_, np.float32)).to(dev)
+        nn_t = torch.from_numpy(nn).to(dev)
+        y = self._forward(X)[:, : self.n_components].clone().requires_grad_(True)
+        opt = torch.optim.Adam([y], lr=lr)
+
+        def q(d2):
+            return 1.0 / (1.0 + a * (d2 + 1e-6) ** b)
+
+        for _ in range(steps):
+            d2 = ((y[:, None, :] - Ytr[nn_t]) ** 2).sum(-1)
+            loss = -torch.log(q(d2) + 1e-6).mean()
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+        return y.detach().cpu().numpy()
 
     def inverse_transform(self, Y):
         self._check()
@@ -184,8 +220,15 @@ class FloDR:
     def score_samples(self, X):
         self._check()
         self._need_density()
+        # log_prob runs the flow itself, so it takes latent coords. passing _forward(X)
+        # would apply the flow twice and return the wrong Jacobian with it
+        dev = next(self.flow_.parameters()).device
+        z = torch.from_numpy(
+            self._to_coords(np.asarray(X, dtype=np.float32))
+        ).float().to(dev)
+
         with torch.no_grad():
-            return self.flow_.log_prob(self._forward(X)).cpu().numpy()
+            return self.flow_.log_prob(z).cpu().numpy()
 
     def _need_density(self):
         if not self.density:
@@ -196,9 +239,8 @@ class FloDR:
             )
 
         if self.flow_._cond is None:
-            # capacity-selected conditional (fit_cond_tail_cv), NOT the deferred fixed-capacity
-            # fit: the fixed default memorises small samples (digits n=898: -1.3 nats/dim
-            # in-sample, +154 held-out), which turns sigma(y) into noise between train points
+            # capacity-selected, not the deferred fixed-capacity fit, because the fixed default
+            # memorises small samples and sigma(y) becomes noise between train points
             self.flow_._density_args = None
             self.flow_.fit_cond_tail_cv(self._coords, seed=self.random_state)
 
@@ -241,9 +283,8 @@ class FloDR:
             )
         if G is not None:
             field, cert = self.hidden_contrast(G, **kw)
-            field_null = cert.pop(
-                "field_null", None
-            )  # absent on the undecided early return
+            # absent when undecided
+            field_null = cert.pop("field_null", None)
             out["hidden_contrast"] = dict(
                 field=field,
                 field_null=None if field_null is None else np.asarray(field_null),
@@ -274,7 +315,8 @@ class FloDR:
         params = [W1, b1, W2, b2, W3, b3]
 
         Xt = torch.as_tensor(np.asarray(Xin, np.float32), device=dev)
-        gt = torch.as_tensor(np.asarray(gRN, np.int64), device=dev)  # (R, n)
+        # (R, n)
+        gt = torch.as_tensor(np.asarray(gRN, np.int64), device=dev)
         fit_rows = torch.as_tensor(np.asarray(rows_fit, np.int64), device=dev)
         opt = torch.optim.Adam(
             params, lr=1e-3, weight_decay=wd, capturable=dev.type == "cuda"
@@ -296,7 +338,8 @@ class FloDR:
             )
 
         def body():
-            logits = fwd(Xt[sel])  # (R, bs, n_cls)
+            # (R, bs, n_cls)
+            logits = fwd(Xt[sel])
             loss = torch.nn.functional.cross_entropy(
                 logits.reshape(-1, n_cls), gt[:, sel].reshape(-1)
             )
@@ -308,7 +351,8 @@ class FloDR:
         out = np.empty((R, len(Xt)), np.float64)
 
         with torch.no_grad():
-            for start in range(0, len(Xt), 8192):  # chunked: R x n x C is large
+            # R x n x C is large
+            for start in range(0, len(Xt), 8192):
                 stop = min(start + 8192, len(Xt))
                 lp = torch.log_softmax(fwd(Xt[start:stop]), 2)
                 idx = gt[:, start:stop].unsqueeze(2)
@@ -406,13 +450,14 @@ class FloDR:
         tree_a = cKDTree(Y[fold_a])
         _, nn_a = tree_a.query(Y, k=min(k_local, len(fold_a)))
 
-        # replica 0 is the real contrast; 1..n_perm are within-bin shuffles. All are fitted in
-        # one batched pass per view, so the permutation null costs little more than the signal.
+        # replica 0 is the real contrast, 1..n_perm are within-bin shuffles, and one batched
+        # pass per view fits them all, so the null costs little more than the signal
         g_rn = np.empty((n_perm + 1, n), np.int64)
         g_rn[0] = g_idx
         for perm_i in range(n_perm):
             g_perm = g_idx.copy()
-            for bin_rows in bins:  # shuffle within bins: contrast dies, marginal lives
+            # within bins the contrast dies, the marginal lives
+            for bin_rows in bins:
                 g_perm[bin_rows] = g_perm[rng.permutation(bin_rows)]
             g_rn[perm_i + 1] = g_perm
 
@@ -422,26 +467,26 @@ class FloDR:
         lp_y = self._class_logp_batched(
             Y, g_rn, fold_c, n_cls, hid, iters, self.random_state + 21
         )
-        gaps = lp_x - lp_y  # (R, n) nats recoverable from x but not from y
+        # (R, n) nats recoverable from x but not from y
+        gaps = lp_x - lp_y
         gap, null_gaps = gaps[0], list(gaps[1:])
         null_gap = np.mean(null_gaps, 0)
 
-        # field: fold-A gap smoothed over screen position, read out anywhere. A was not seen
-        # by either classifier, so the field carries no in-sample optimism; subtracting the
-        # null's field removes the capacity-mismatch bias, which is not zero.
+        # the fold-A gap smoothed over screen position. Neither classifier saw A, so there
+        # is no in-sample optimism, and subtracting the null removes the capacity-mismatch bias
         field = (gap - null_gap)[fold_a][nn_a].mean(1)
         gap = gap - null_gap
         null_level = [float(np.mean((ng - null_gap)[fold_b])) for ng in null_gaps]
 
-        # a visual null for the figure: one permutation debiased by the OTHERS, so it is a
-        # genuine held-out null rather than a residual that is zero by construction
+        # one permutation debiased by the others, so the figure's null is held out rather
+        # than a residual that is zero by construction
         field_null = (
             ((null_gaps[0] - np.mean(null_gaps[1:], 0))[fold_a][nn_a].mean(1))
             if n_perm >= 2
             else np.zeros_like(field)
         )
 
-        # certificate: does the fold-A field predict fold-B's own gap, per screen bin?
+        # the certificate asks whether the fold-A field predicts fold-B's gap, per screen bin
         bin_pairs = []
         for b in np.unique(bin_id[fold_b]):
             sel = fold_b[bin_id[fold_b] == b]
@@ -456,7 +501,7 @@ class FloDR:
             np.array([pair[0] for pair in bin_pairs]),
             np.array([pair[1] for pair in bin_pairs]),
         )
-        # linear, not log: the gap is a difference of log-likelihoods and may be negative
+        # linear, not log, the gap is a log-likelihood difference and can be negative
         design = np.column_stack([pred, np.ones_like(pred)])
         coef, *_ = np.linalg.lstsq(design, tgt, rcond=None)
         r2 = float(
@@ -486,7 +531,7 @@ class FloDR:
 
             slope_pass.append(0.7 <= coef_b[0] <= 1.3)
             r2_pass.append(r2_b >= 0.6)
-        # level: does the debiased signal clear its own permutation null, one-sided
+        # one-sided, asking whether the debiased signal clears its own permutation null
         obs = float(np.mean(gap[fold_b]))
         p_level = (1.0 + sum(lvl >= obs for lvl in null_level)) / (
             1.0 + len(null_level)
@@ -563,8 +608,7 @@ class FloDR:
             x_bin = X[fold_b][sel].astype(np.float64)
             emp_var.append(((x_bin - x_bin.mean(0)) ** 2).sum(1).mean())
 
-            # Var(mu) term: without it, bin smearing biases the slope up (measured 1.74 on
-            # a field whose sigma/truth = 1.00)
+            # without the Var(mu) term, bin smearing biases the slope up
             mu_bin = mu[sel].astype(np.float64)
             mod_var.append(
                 float(
@@ -574,7 +618,7 @@ class FloDR:
 
         emp_var, mod_var = np.array(emp_var), np.array(mod_var)
 
-        # log space: bin variances span decades, raw regression is dominated by the top bins
+        # in log space, because bin variances span decades and the top bins would dominate
         log_emp, log_mod = (
             np.log(np.maximum(emp_var, 1e-12)),
             np.log(np.maximum(mod_var, 1e-12)),
@@ -595,17 +639,15 @@ class FloDR:
             np.percentile(emp_var, 95) / max(np.percentile(emp_var, 5), 1e-12)
         )
 
-        level_ok = bool(
-            0.5 <= np.median(ratio) <= 2.0
-        )  # the log intercept absorbs constant
+        # gated separately from the shape, because the log intercept absorbs a constant bias
+        level_ok = bool(0.5 <= np.median(ratio) <= 2.0)
 
         passed = level_ok and (
-            dyn_range < 3.0  # bias, so level is gated separately
-            or (0.7 <= coef[0] <= 1.3 and r2 >= 0.6)
+            dyn_range < 3.0 or (0.7 <= coef[0] <= 1.3 and r2 >= 0.6)
         )
 
-        # bootstrap over bins, intersection-union: scarce data gives low confidence on its
-        # own, separating "insufficient data" from "measured miscalibration"
+        # intersection-union bootstrap over bins, so scarce data reads as low confidence
+        # rather than as measured miscalibration
         rng_b = np.random.default_rng(self.random_state + 7)
         n_pairs = len(emp_var)
         slope_pass, r2_pass, level_pass = [], [], []
