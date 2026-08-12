@@ -836,10 +836,13 @@ source = { editable = "." }
 dependencies = [
     { name = "matplotlib" },
     { name = "numpy" },
+    { name = "scanpy", version = "1.11.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "scanpy", version = "1.12.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "scikit-learn" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "scipy", version = "1.18.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "torch" },
+    { name = "tqdm" },
     { name = "typing-extensions" },
     { name = "usearch" },
 ]
@@ -849,8 +852,6 @@ notebook = [
     { name = "ipykernel" },
     { name = "nbconvert" },
     { name = "nbformat" },
-    { name = "scanpy", version = "1.11.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "scanpy", version = "1.12.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 paper = [
     { name = "aiohttp" },
@@ -887,11 +888,12 @@ requires-dist = [
     { name = "pandas", marker = "extra == 'paper'", specifier = ">=2.0" },
     { name = "pillow", marker = "extra == 'paper'", specifier = ">=10.0" },
     { name = "pymde", marker = "extra == 'paper'", specifier = ">=0.1" },
-    { name = "scanpy", marker = "extra == 'notebook'", specifier = ">=1.10" },
+    { name = "scanpy", specifier = ">=1.11.5" },
     { name = "scanpy", marker = "extra == 'paper'", specifier = ">=1.10" },
     { name = "scikit-learn", specifier = ">=1.4" },
     { name = "scipy", specifier = ">=1.11" },
     { name = "torch", specifier = ">=2.1" },
+    { name = "tqdm", specifier = ">=4.66" },
     { name = "typing-extensions", specifier = ">=4.15" },
     { name = "umap-learn", marker = "extra == 'paper'", specifier = ">=0.5" },
     { name = "usearch", specifier = ">=2.25.3" },

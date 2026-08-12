@@ -15,6 +15,7 @@ dependencies = [
     "usearch>=2.25.3",
     "typing-extensions>=4.15",
     "tqdm>=4.66",
+    "scanpy>=1.11.5",
 ]
 
 [project.optional-dependencies]
