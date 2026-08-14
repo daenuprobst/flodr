@@ -136,6 +136,18 @@ class Muon(torch.optim.Optimizer):
                     )
 
 
+# Largest edge batch the auto mode will use. Below this the graph is taken whole.
+#
+# Measured across all seven paper data sets against the previous edge_batch=16384 with
+# iters=6400, it's 3.6-4.4x faster on the four benchmark sets at flat quality, and +14-21%
+# recall with CPD also up on the three atlases. The old constant was set to fix a GPU
+# OOM at 500k points and became a global default. It over-trains small data with tiny
+# steps and starves large data. What matters is passes over the edge set,
+# iters * edge_batch / n_edges, which the old setting left at ~700 for n=5000 (saturates
+# near 350) and ~34 for n=100k.
+EDGE_BATCH_CAP = 262_144
+
+
 @dataclass
 class TrainConfig:
     iters: int = 700
@@ -174,8 +186,9 @@ class TrainConfig:
     aux_batch: int = 512
     # trailing fraction of iters run full-batch
     aux_full_frac: float = 0.2
-    # kNN edges per iter (0 = full batch), no cudagraphs
-    edge_batch: int = 0
+    # kNN edges per iter. 0 = full batch, -1 = auto (see EDGE_BATCH_CAP): full batch
+    # while the graph fits, capped above that. No cudagraphs when set.
+    edge_batch: int = -1
     # couplings of the post-hoc conditional density tail
     cond_tail: int = 2
     cond_iters: int = 1500
@@ -193,6 +206,11 @@ class TrainConfig:
     cudagraphs: bool = None
     # checkpoint the recon-inverse pass, less memory, slower
     checkpoint: bool = False
+    # recompute the conditioner MLP in backward. The (N, hid) activations it holds are
+    # most of a fit's memory; exact, costs about a third more flow compute
+    ckpt_net: bool = False
+    # recompute the repulsive pointwise chain in backward. Exact, nearly free
+    ckpt_neg: bool = False
     # embedding dimension
     k: int = 2
     # nested-dropout cuts
@@ -213,6 +231,8 @@ class TrainConfig:
     shallow: bool = False
     # >0 bounds |log scale| per coupling
     gate_max: float = 0.0
+    # >0 makes the bound per dimension: this on the display, gate_max on the residual
+    gate_display: float = 0.0
     seed: int = 0
 
 
@@ -221,14 +241,16 @@ def raw_recipe(seed=0, threads=None, **overrides):
     if threads is None:
         threads = 0 if dev.startswith("cuda") else perf_cores()
 
-    # 400 iters under-trains past n~50k. 800 is the smallest budget that holds the
-    # recall margin over UMAP, and more is non-monotone within the seed scatter
+    # 1600 iterations at lr 0.01 against the previous 800 at 0.02, holding
+    # lr * iters = 16, which is the invariant that matters because Newton-Schulz makes
+    # Muon's step magnitude-blind. Paired with edge_batch=-1 this is 3.6-4.4x faster on
+    # the benchmark sets and +14-21% recall on the atlases; see EDGE_BATCH_CAP.
     kw = dict(
         seed=seed,
         threads=threads,
         sketch=64,
         onecycle=True,
-        iters=800,
+        iters=1600,
         aux_full_frac=0.05,
         w_nll=0.0,
         cond_tail=0,
@@ -236,7 +258,22 @@ def raw_recipe(seed=0, threads=None, **overrides):
         # 17x penalty if bf16 is emulated rather than native
         bf16=native_bf16(dev),
         optim="muon",
-        lr=0.02,
+        lr=0.01,
+        # the scale bound is per dimension: 1.0 on the display, 0.5 on the residual
+        gate_max=0.5,
+        gate_display=1.0,
+        # 0.3 spends a third of a 1600-iteration run ramping, which at this schedule
+        # is most of the useful training
+        warmup_frac=0.05,
+        # 48 rather than the 12 of TrainConfig's own default. Measured under this
+        # schedule against neg=12, the four benchmark sets lose about 1% recall, but
+        # the atlases lose 13-20% (plant 0.0799 to 0.0643, bone marrow 0.1728 to
+        # 0.1501). Same story as the schedule itself (at n=5000 the fit is past
+        # saturation and the extra negatives are wasted, at n=100k it is starved and
+        # they convert straight into neighbour retention). The benchmark cost is 20-27%
+        # wall clock on fits that already take under 30 s, which is the cheaper side of
+        # the trade.
+        neg=48,
         w_rep=15.0,
         # raw mode defers recon anyway
         w_recon=0.0,
@@ -280,6 +317,11 @@ def train_flodr(
     # floored at k, because a cut below the embedding would zero part of the map
     cuts = tuple(sorted({min(max(c, k), D) for c in cfg.cuts} | {D}))
 
+    # class-level so it also reaches couplings built outside Flow (the density tail)
+    from .model import Coupling as _Coupling
+
+    _Coupling.ckpt_net = bool(cfg.ckpt_net)
+
     flow = Flow(
         D,
         cfg.n_layers,
@@ -288,6 +330,7 @@ def train_flodr(
         act=cfg.act,
         sketch_head=cfg.sketch_head,
         gate_max=cfg.gate_max,
+        gate_display=cfg.gate_display,
         shallow=cfg.shallow,
         k=k,
     ).to(dev)
@@ -533,6 +576,11 @@ def train_flodr(
             + cfg.w_jac * L_jac
         )
 
+    # logdet feeds only L_nll, and z_sub/rows feed only L_nll and L_recon. The raw
+    # recipe leaves both weights at zero, so on that path the log-determinant
+    # accumulation and its backward are computed and then multiplied by nothing.
+    needs_logdet = bool(cfg.w_nll or cfg.w_recon)
+
     def step_edge_batch(edge_idx, keep, ramp):
         pts = torch.cat([edge_i[edge_idx], edge_j[edge_idx]])
         uniq, inv = torch.unique(pts, return_inverse=True)
@@ -541,7 +589,11 @@ def train_flodr(
         # gather once (was doubled for recon)
         x_uniq = x_t[uniq]
 
-        Z, logdet = flow.forward_with_logdet(x_uniq)
+        if needs_logdet:
+            Z, logdet = flow.forward_with_logdet(x_uniq)
+        else:
+            Z, logdet = flow.forward_main(x_uniq), None
+
         Y = Z[:, :k]
 
         d2_edge = ((Y[inv[:n_edge]] - Y[inv[n_edge:]]) ** 2).sum(1)
@@ -550,28 +602,57 @@ def train_flodr(
         if w_attr is None:
             L_attr = -torch.log(w_edge + 1e-6).mean()
         else:
-            L_attr = (
-                -(w_attr[edge_idx] * torch.log(w_edge + 1e-6)).sum()
-                / w_attr[edge_idx].sum()
+            # gathered once, not twice
+            wa = w_attr[edge_idx]
+            L_attr = -(wa * torch.log(w_edge + 1e-6)).sum() / wa.sum()
+
+        # int32 throughout: n is far below 2^31 and the full-batch path's _ri helper
+        # already draws int32 and indexes Y with it, so this is the same trick applied
+        # to the branch that was left out. Halves index traffic and the sort key width
+        # in the scatter backward.
+        neg_a = torch.randint(
+            0, n_uniq, (cfg.neg * n_edge,), device=dev, dtype=torch.int32, generator=gen
+        )
+        neg_b = torch.randint(
+            0, n_uniq, (cfg.neg * n_edge,), device=dev, dtype=torch.int32, generator=gen
+        )
+
+        # The repulsive block is a long pointwise chain over neg*edge_batch pairs, and
+        # every link of it is retained for backward. At neg=48, edge_batch=262144 that
+        # is ~12.6M elements a dozen times over. Recomputing it in backward costs one
+        # extra pass over cheap 2D arithmetic and holds only the two index tensors.
+        # Exact: the indices are drawn outside, so the recompute sees the same input.
+        def _rep(Yv, ia, ib):
+            d2 = ((Yv[ia] - Yv[ib]) ** 2).sum(1)
+
+            return -torch.log(1.0 - 1.0 / (1.0 + a * (d2 + 1e-6) ** b) + 1e-6).mean()
+
+        if cfg.ckpt_neg and torch.is_grad_enabled():
+            L_rep = torch.utils.checkpoint.checkpoint(
+                _rep, Y, neg_a, neg_b, use_reentrant=False
             )
+        else:
+            L_rep = _rep(Y, neg_a, neg_b)
 
-        neg_a = torch.randint(0, n_uniq, (cfg.neg * n_edge,), device=dev, generator=gen)
-        neg_b = torch.randint(0, n_uniq, (cfg.neg * n_edge,), device=dev, generator=gen)
+        glob_a = torch.randint(
+            0, n_uniq, (3 * n_uniq,), device=dev, dtype=torch.int32, generator=gen
+        )
 
-        d2_neg = ((Y[neg_a] - Y[neg_b]) ** 2).sum(1)
-        w_neg = 1.0 / (1.0 + a * (d2_neg + 1e-6) ** b)
+        glob_b = torch.randint(
+            0, n_uniq, (3 * n_uniq,), device=dev, dtype=torch.int32, generator=gen
+        )
 
-        L_rep = -torch.log(1.0 - w_neg + 1e-6).mean()
-
-        glob_a = torch.randint(0, n_uniq, (3 * n_uniq,), device=dev, generator=gen)
-        glob_b = torch.randint(0, n_uniq, (3 * n_uniq,), device=dev, generator=gen)
         d2_glob = ((Y[glob_a] - Y[glob_b]) ** 2).sum(1)
         L_glob = (d2_glob / (1.0 + d2_glob)).mean()
 
         if cfg.w_stress:
             n_pairs = 4 * n_uniq
-            idx_a = torch.randint(0, n_uniq, (n_pairs,), device=dev, generator=gen)
-            idx_b = torch.randint(0, n_uniq, (n_pairs,), device=dev, generator=gen)
+            idx_a = torch.randint(
+                0, n_uniq, (n_pairs,), device=dev, dtype=torch.int32, generator=gen
+            )
+            idx_b = torch.randint(
+                0, n_uniq, (n_pairs,), device=dev, dtype=torch.int32, generator=gen
+            )
             row_a, row_b = uniq[idx_a], uniq[idx_b]
             mask_a = (((row_a + row_b) % 5) != 0).float()
 
@@ -582,8 +663,14 @@ def train_flodr(
             mdist_a = _lh(row_a, row_b)
 
             if cfg.stress_ordinal:
-                idx_c = torch.randint(0, n_uniq, (n_pairs,), device=dev, generator=gen)
-                idx_d = torch.randint(0, n_uniq, (n_pairs,), device=dev, generator=gen)
+                idx_c = torch.randint(
+                    0, n_uniq, (n_pairs,), device=dev, dtype=torch.int32, generator=gen
+                )
+
+                idx_d = torch.randint(
+                    0, n_uniq, (n_pairs,), device=dev, dtype=torch.int32, generator=gen
+                )
+
                 row_c, row_d = uniq[idx_c], uniq[idx_d]
                 mask_b = (((row_c + row_d) % 5) != 0).float()
                 ldist_b = 0.5 * torch.log(
@@ -603,25 +690,37 @@ def train_flodr(
         else:
             L_stress = 0.0
 
+        # rows, z_sub and logdet_s feed only L_recon and L_nll. With both weights at
+        # zero, as the raw recipe leaves them, this whole block is gathered and then
+        # discarded.
+
+        # The draw stays unconditional even when nothing consumes it. It is one cheap
+        # randint, and skipping it would advance the generator differently and change
+        # every subsequent sample. This is ar eseed, which quietly moves results without
+        # improving anything. Only the gather it feeds is skipped.
         rows = torch.randint(
             0, n_uniq, (min(aux_n, n_uniq),), device=dev, generator=gen
         )
+        z_sub, logdet_s = (Z[rows], logdet[rows]) if needs_logdet else (None, None)
 
-        z_sub, logdet_s = Z[rows], logdet[rows]
-        y_head = z_sub[:, :k].detach() if cfg.recon_detach else z_sub[:, :k]
-        z_trunc = torch.cat([y_head, z_sub[:, k:]], 1) * keep
+        if cfg.w_recon:
+            y_head = z_sub[:, :k].detach() if cfg.recon_detach else z_sub[:, :k]
+            z_trunc = torch.cat([y_head, z_sub[:, k:]], 1) * keep
 
-        if cfg.checkpoint:
-            x_rec = z_trunc
+            if cfg.checkpoint:
+                x_rec = z_trunc
 
-            for c in reversed(flow.layers):
-                x_rec = torch.utils.checkpoint.checkpoint(
-                    c.inverse, x_rec, use_reentrant=False
-                )
+                for c in reversed(flow.layers):
+                    x_rec = torch.utils.checkpoint.checkpoint(
+                        c.inverse, x_rec, use_reentrant=False
+                    )
+            else:
+                x_rec = flow.inverse(z_trunc)
+
+            L_recon = ((x_rec - x_uniq[rows]) ** 2).mean()
         else:
-            x_rec = flow.inverse(z_trunc)
+            L_recon = 0.0
 
-        L_recon = ((x_rec - x_uniq[rows]) ** 2).mean()
         L_nll = -(flow.base_log_prob(z_sub) + logdet_s).mean() / D if cfg.w_nll else 0.0
 
         if cfg.w_chart:
@@ -667,9 +766,11 @@ def train_flodr(
         # ramp enters the graph as a tensor, a fresh python float would recompile every iter
         ramps = torch.tensor(
             [
-                1.0
-                if cfg.warmup_frac <= 0
-                else min(1.0, (i + 1) / (cfg.warmup_frac * cfg.iters))
+                (
+                    1.0
+                    if cfg.warmup_frac <= 0
+                    else min(1.0, (i + 1) / (cfg.warmup_frac * cfg.iters))
+                )
                 for i in range(cfg.iters)
             ],
             dtype=torch.float32,
@@ -693,7 +794,11 @@ def train_flodr(
             0, n, (size,), device=dev, dtype=torch.int32, generator=gen
         )
 
-    eb_size = min(cfg.edge_batch, n_edges) if cfg.edge_batch else 0
+    if cfg.edge_batch < 0:
+        # full batch while the graph fits, capped above that
+        eb_size = 0 if n_edges <= EDGE_BATCH_CAP else EDGE_BATCH_CAP
+    else:
+        eb_size = min(cfg.edge_batch, n_edges) if cfg.edge_batch else 0
 
     steps = range(cfg.iters)
 
@@ -708,11 +813,17 @@ def train_flodr(
             if cfg.warmup_frac <= 0
             else min(1.0, (it + 1) / (cfg.warmup_frac * cfg.iters))
         )
-        cut = int(rng.choice(cuts))
-        keep = (dim_idx < cut).to(torch.float32)
+
+        # keep feeds only the recon branch; skip the host-side draw when it is off
+        if cfg.w_recon:
+            keep = (dim_idx < int(rng.choice(cuts))).to(torch.float32)
+        else:
+            keep = None
 
         if eb_size:
-            edge_idx = torch.randint(0, n_edges, (eb_size,), device=dev, generator=gen)
+            edge_idx = torch.randint(
+                0, n_edges, (eb_size,), device=dev, dtype=torch.int32, generator=gen
+            )
             loss = step_edge_batch(edge_idx, keep, ramp)
         else:
             neg_a, neg_b = _ri(cfg.neg * n_edges), _ri(cfg.neg * n_edges)

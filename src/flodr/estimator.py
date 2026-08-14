@@ -4,10 +4,22 @@ import numpy as np
 import torch
 from scipy.spatial import cKDTree
 
+from . import viz
 from .data import find_ab, fuzzy_knn_graph, knn_query, raw_coords
 from .model import graph_loop
 from .train import default_device, raw_recipe, train_flodr
-from . import viz
+
+# Keeping only the heaviest quarter of the fuzzy graph is worth +32 to +41 percent
+# recall between about fifty thousand and half a million points, is flat past a
+# million, and costs recall below about ten thousand, where the graph is the only
+# thing holding the layout together. So it is gated on n rather than always on.
+PRUNE_KEEP = 0.25
+PRUNE_RANGE = (50_000, 500_000)
+
+
+def prune_fraction(n):
+    lo, hi = PRUNE_RANGE
+    return PRUNE_KEEP if lo <= n <= hi else 1.0
 
 
 class NotFittedError(ValueError):
@@ -111,7 +123,9 @@ class FloDR:
         if not hasattr(self, "flow_"):
             raise NotFittedError("call fit first")
 
-    def fit(self, X, y=None, iters=800, progress=True):
+    # iters=None defers to raw_recipe's schedule (1600 at lr 0.01), which is
+    # the validated pairing with edge_batch=-1. Pass number to override.
+    def fit(self, X, y=None, iters=None, progress=True):
         if not (isinstance(self.n_components, int) and self.n_components >= 2):
             raise ValueError(
                 "n_components must be an int >= 2 (the embedding is the flow's first "
@@ -140,6 +154,12 @@ class FloDR:
         self.knn_idx_, edge_i, edge_j, w_attr, self.knn_dist_ = fuzzy_knn_graph(
             X, self._FROZEN["n_neighbors"], precomputed=pre, return_dist=True
         )
+        keep = prune_fraction(len(X))
+
+        if keep < 1.0:
+            sel = np.sort(np.argsort(-w_attr)[: int(round(keep * len(w_attr)))])
+            edge_i, edge_j, w_attr = edge_i[sel], edge_j[sel], w_attr[sel]
+
         self._cfg = self._config(X, iters)
         Y, roundtrip, _, flow = train_flodr(
             Z,
@@ -164,7 +184,9 @@ class FloDR:
 
         return self
 
-    def fit_transform(self, X, y=None, iters=800, progress=True):
+    # iters=None defers to raw_recipe's schedule (1600 at lr 0.01), which is
+    # the validated pairing with edge_batch=-1. Pass a number to override.
+    def fit_transform(self, X, y=None, iters=None, progress=True):
         return self.fit(X, iters=iters, progress=progress).embedding_
 
     def _forward(self, X):
@@ -184,7 +206,9 @@ class FloDR:
         _, nn = knn_query(self._X, X, self._FROZEN["n_neighbors"], self._metric)
         a, b = find_ab(self._cfg.min_dist)
         dev = next(self.flow_.parameters()).device
-        Ytr = torch.from_numpy(np.ascontiguousarray(self.embedding_, np.float32)).to(dev)
+        Ytr = torch.from_numpy(np.ascontiguousarray(self.embedding_, np.float32)).to(
+            dev
+        )
         nn_t = torch.from_numpy(nn).to(dev)
         y = self._forward(X)[:, : self.n_components].clone().requires_grad_(True)
         opt = torch.optim.Adam([y], lr=lr)
@@ -223,9 +247,11 @@ class FloDR:
         # log_prob runs the flow itself, so it takes latent coords. passing _forward(X)
         # would apply the flow twice and return the wrong Jacobian with it
         dev = next(self.flow_.parameters()).device
-        z = torch.from_numpy(
-            self._to_coords(np.asarray(X, dtype=np.float32))
-        ).float().to(dev)
+        z = (
+            torch.from_numpy(self._to_coords(np.asarray(X, dtype=np.float32)))
+            .float()
+            .to(dev)
+        )
 
         with torch.no_grad():
             return self.flow_.log_prob(z).cpu().numpy()
@@ -642,9 +668,7 @@ class FloDR:
         # gated separately from the shape, because the log intercept absorbs a constant bias
         level_ok = bool(0.5 <= np.median(ratio) <= 2.0)
 
-        passed = level_ok and (
-            dyn_range < 3.0 or (0.7 <= coef[0] <= 1.3 and r2 >= 0.6)
-        )
+        passed = level_ok and (dyn_range < 3.0 or (0.7 <= coef[0] <= 1.3 and r2 >= 0.6))
 
         # intersection-union bootstrap over bins, so scarce data reads as low confidence
         # rather than as measured miscalibration

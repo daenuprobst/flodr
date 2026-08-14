@@ -60,11 +60,27 @@ class Coupling(torch.nn.Module):
         shallow=False,
         sketch_head=0,
         gate_max=0.0,
+        gate_display=0.0,
+        k=2,
     ):
         super().__init__()
         self.register_buffer("mask", mask)
-        self.gate = torch.nn.Parameter(torch.ones(1))
         self.gate_max = float(gate_max)
+
+        # Per-dimension scale bound. gate_display on the k display coordinates and
+        # gate_max on the residual, rather than one scalar shared by all of them. The
+        # display carries the layout and needs the range while the residual only has to stay
+        # invertible, and bounding it harder is what keeps the round trip tight. Zero
+        # falls back to the scalar gate, which is what the conditional density tail
+        # wants. Namely, a per-display-dimension bound means nothing to a density tail.
+        vec = gate_display > 0
+        gm = torch.full((d,), float(gate_max)) if vec else None
+
+        if vec:
+            gm[:k] = float(gate_display)
+
+        self.register_buffer("gmax_vec", gm)
+        self.gate = torch.nn.Parameter(torch.ones(d if vec else 1))
         d_out = 2 * d
 
         # condition on a fixed random projection of the masked dims, since a coupling stays
@@ -93,14 +109,30 @@ class Coupling(torch.nn.Module):
             self.net[-1].weight.mul_(0.0)
             self.net[-1].bias.mul_(0.0)
 
+    # Recompute the conditioner in backward instead of storing its activations. The
+    # two (N, hid) tanh outputs per layer are the bulk of the memory a fit holds,
+    # about 72% of it at hid=256, while their inputs are (N, D) and their output is
+    # (N, 2D). Exact, not an approximation. Nothing here depends on invertibility, so
+    # it is safe even where the round-trip error is poor. Class-level so the flag also
+    # reaches couplings built outside Flow, such as the conditional density tail.
+    ckpt_net = False
+
     def _st(self, xm):
         free = 1 - self.mask
         inp = xm @ self.S.T if self.S is not None else xm
-        s_raw, t_raw = self.net(inp).chunk(2, dim=1)
 
-        gate = (
-            self.gate if self.gate_max <= 0 else self.gate_max * torch.tanh(self.gate)
-        )
+        if self.ckpt_net and torch.is_grad_enabled() and inp.requires_grad:
+            head = torch.utils.checkpoint.checkpoint(self.net, inp, use_reentrant=False)
+        else:
+            head = self.net(inp)
+
+        s_raw, t_raw = head.chunk(2, dim=1)
+
+        if self.gate_max <= 0:
+            gate = self.gate
+        else:
+            bound = self.gate_max if self.gmax_vec is None else self.gmax_vec
+            gate = bound * torch.tanh(self.gate)
 
         return gate * torch.tanh(s_raw) * free, t_raw * free
 
@@ -226,14 +258,29 @@ class Flow(torch.nn.Module):
         shallow=False,
         sketch_head=0,
         gate_max=0.0,
+        gate_display=0.0,
         k=2,
     ):
         super().__init__()
         layers = []
 
+        # Deterministic alternating masks rather than a random half-draw. Counting from
+        # one, even layers transform the display conditioned on the whole residual, and
+        # odd layers transform half the residual conditioned on the display and the
+        # other half. Two reasons the draw was worse. (1) It leaves a display axis untouched
+        # by every layer in about one seed in eight, and (2) it does not guarantee the
+        # display is written by the final coupling, without which the last layer only
+        # moves coordinates nothing downstream reads.
+        res = torch.arange(k, d)
         for i in range(n_layers):
             mask = torch.zeros(d)
-            mask[torch.randperm(d)[: d // 2]] = 1.0
+
+            if (i + 1) % 2 == 0:
+                mask[k:] = 1.0
+            else:
+                mask[:k] = 1.0
+                mask[res[(i // 2) % 2 :: 2]] = 1.0
+
             layers.append(
                 Coupling(
                     d,
@@ -244,6 +291,8 @@ class Flow(torch.nn.Module):
                     shallow=shallow,
                     sketch_head=sketch_head,
                     gate_max=gate_max,
+                    gate_display=gate_display,
+                    k=k,
                 )
             )
 
