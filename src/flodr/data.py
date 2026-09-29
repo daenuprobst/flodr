@@ -3,10 +3,10 @@ import warnings
 import numpy as np
 from scipy.linalg import null_space
 from scipy.optimize import curve_fit
-from scipy.spatial import cKDTree
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import laplacian
 from scipy.sparse.linalg import eigsh
+from scipy.spatial import cKDTree
 from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
 from usearch.index import Index
@@ -37,9 +37,36 @@ def preprocess(
     return out[0] if len(out) == 1 else tuple(out)
 
 
+# the fitted map between inputs and the whitened coordinates the flow sees. an object rather
+# than closures, so a fitted model pickles
+class Whitening:
+    def __init__(self, pca, n_head, head_mu, head_sd, tail_v, tail_sd):
+        self.pca, self.n_head = pca, n_head
+        self.head_mu, self.head_sd = head_mu, head_sd
+        self.tail_v, self.tail_sd = tail_v, tail_sd
+
+    def to_raw(self, Zn):
+        Zn = np.asarray(Zn, dtype=np.float32)
+        head = Zn[:, : self.n_head] * self.head_sd + self.head_mu
+        tail = Zn[:, self.n_head :] * self.tail_sd
+
+        return (
+            self.pca.mean_ + head @ self.pca.components_ + tail @ self.tail_v.T
+        ).astype(np.float32)
+
+    def to_coords(self, Xn):
+        Xn = np.asarray(Xn, dtype=np.float32)
+        head = (self.pca.transform(Xn) - self.head_mu) / self.head_sd
+        tail = ((Xn - self.pca.mean_) @ self.tail_v) / self.tail_sd
+
+        return np.hstack([head, tail]).astype(np.float32)
+
+
 def raw_coords(X, n_components=50, seed=0):
     X = np.asarray(X, dtype=np.float32)
-    n_head = min(n_components, X.shape[1] - 1)
+
+    # PCA cannot return more components than it has samples
+    n_head = min(n_components, X.shape[1] - 1, X.shape[0] - 1)
 
     pca = PCA(n_components=n_head, svd_solver="randomized", random_state=seed).fit(X)
 
@@ -52,22 +79,9 @@ def raw_coords(X, n_components=50, seed=0):
     tail_sd = np.maximum(tail.std(0), 1e-2 * tail.std(0).max() + 1e-12)
 
     Z = np.hstack([(proj - head_mu) / head_sd, tail / tail_sd]).astype(np.float32)
+    wh = Whitening(pca, n_head, head_mu, head_sd, tail_v, tail_sd)
 
-    def to_raw(Zn):
-        Zn = np.asarray(Zn, dtype=np.float32)
-        head = Zn[:, :n_head] * head_sd + head_mu
-        tail = Zn[:, n_head:] * tail_sd
-
-        return (pca.mean_ + head @ pca.components_ + tail @ tail_v.T).astype(np.float32)
-
-    def to_coords(Xn):
-        Xn = np.asarray(Xn, dtype=np.float32)
-        head = (pca.transform(Xn) - head_mu) / head_sd
-        tail = ((Xn - pca.mean_) @ tail_v) / tail_sd
-
-        return np.hstack([head, tail]).astype(np.float32)
-
-    return Z, to_raw, to_coords
+    return Z, wh.to_raw, wh.to_coords
 
 
 def spectral_init(ei, ej, w, n, scale=1.0, seed=0):
@@ -151,9 +165,7 @@ def knn_search(Xp, k, exact=None):
         dist2 = np.take_along_axis(dist2, order, axis=1)
 
     # push self last
-    order = np.argsort(
-        keys == np.arange(n)[:, None], axis=1, kind="stable"
-    )
+    order = np.argsort(keys == np.arange(n)[:, None], axis=1, kind="stable")
     keys = np.take_along_axis(keys, order, axis=1)[:, :k]
     dist2 = np.take_along_axis(dist2, order, axis=1)[:, :k]
 
@@ -187,6 +199,7 @@ def fuzzy_knn_graph(Xp, k, n_iter=64, precomputed=None, return_dist=False):
     rows = np.repeat(np.arange(n), k)
     A = coo_matrix((w_attr.ravel(), (rows, idx.ravel())), shape=(n, n)).tocsr()
     B = (A + A.T - A.multiply(A.T)).tocoo()
+
     # unique undirected edges
     mask = B.row < B.col
     out = (

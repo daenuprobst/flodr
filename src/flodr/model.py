@@ -1,4 +1,5 @@
 import copy
+import functools
 import math
 import os
 
@@ -6,6 +7,11 @@ import numpy as np
 import torch
 from sklearn.cluster import KMeans
 from sklearn.mixture import GaussianMixture
+from threadpoolctl import threadpool_limits
+
+# the tail fits train on a few hundred rows at a time. on a loaded CPU more threads only
+# add barrier waits, 8 ran 3-4x slower than 4 and uncapped pools stalled for minutes
+SMALL_FIT_THREADS = 4
 
 
 def graph_loop(iters, draw, body, dev, warmup=3):
@@ -40,8 +46,8 @@ def graph_loop(iters, draw, body, dev, warmup=3):
                 graph.replay()
 
             return
-        # capture unsupported, finish eagerly
         except RuntimeError:
+            # capture unsupported
             pass
 
     for _ in range(iters - done):
@@ -49,7 +55,42 @@ def graph_loop(iters, draw, body, dev, warmup=3):
         body()
 
 
+def _few_threads(fn):
+    @functools.wraps(fn)
+    def wrapped(self, *args, **kw):
+        if self.base_logvar.device.type != "cpu":
+            return fn(self, *args, **kw)
+
+        prev = torch.get_num_threads()
+
+        # torch last, since leaving threadpool_limits resets the OpenMP pool torch runs on
+        try:
+            with threadpool_limits(SMALL_FIT_THREADS):
+                torch.set_num_threads(min(prev, SMALL_FIT_THREADS))
+
+                return fn(self, *args, **kw)
+        finally:
+            torch.set_num_threads(prev)
+
+    return wrapped
+
+
+def _mlp(net, x):
+    # under autocast the output layer stays fp32: it writes the layout, and bf16 rounds that
+    # at about 3x the 1-NN spacing
+    if not (Coupling.fp32_head and torch.is_autocast_enabled(x.device.type)):
+        return net(x)
+
+    h = net[:-1](x)
+
+    with torch.autocast(x.device.type, enabled=False):
+        return net[-1](h.float())
+
+
 class Coupling(torch.nn.Module):
+    # set by train_flodr, see _mlp
+    fp32_head = False
+
     def __init__(
         self,
         d,
@@ -60,11 +101,22 @@ class Coupling(torch.nn.Module):
         shallow=False,
         sketch_head=0,
         gate_max=0.0,
+        gate_display=0.0,
+        k=2,
     ):
         super().__init__()
         self.register_buffer("mask", mask)
-        self.gate = torch.nn.Parameter(torch.ones(1))
         self.gate_max = float(gate_max)
+
+        # per-dim scale bound when >0: gate_display on the first k dims, gate_max after
+        gate_vec = None
+
+        if gate_display > 0:
+            gate_vec = torch.full((d,), float(gate_max))
+            gate_vec[:k] = float(gate_display)
+
+        self.register_buffer("gmax_vec", gate_vec)
+        self.gate = torch.nn.Parameter(torch.ones(1 if gate_vec is None else d))
         d_out = 2 * d
 
         # condition on a fixed random projection of the masked dims, since a coupling stays
@@ -96,11 +148,15 @@ class Coupling(torch.nn.Module):
     def _st(self, xm):
         free = 1 - self.mask
         inp = xm @ self.S.T if self.S is not None else xm
-        s_raw, t_raw = self.net(inp).chunk(2, dim=1)
+        net = self.net
+        head = _mlp(net, inp) if isinstance(net, torch.nn.Sequential) else net(inp)
+        s_raw, t_raw = head.chunk(2, dim=1)
 
-        gate = (
-            self.gate if self.gate_max <= 0 else self.gate_max * torch.tanh(self.gate)
-        )
+        if self.gate_max <= 0:
+            gate = self.gate
+        else:
+            bound = self.gate_max if self.gmax_vec is None else self.gmax_vec
+            gate = bound * torch.tanh(self.gate)
 
         return gate * torch.tanh(s_raw) * free, t_raw * free
 
@@ -123,6 +179,55 @@ class Coupling(torch.nn.Module):
         return y_masked + (1 - self.mask) * ((y - shift) * torch.exp(-scale))
 
 
+class FourierShift(torch.nn.Module):
+    # shift-only branch on fixed random frequencies, added to a coupling's conditioner.
+    # the scale is untouched, so the log-det is too
+    def __init__(
+        self, base, d_in, hid, d_out, n_freq=256, lo=2.0, hi=6.0, eps=0.25, gen=None
+    ):
+        super().__init__()
+        self.base = base
+        shift_mask = torch.zeros(d_out)
+        shift_mask[d_out // 2 :] = 1.0
+        self.register_buffer("shift_mask", shift_mask)
+
+        mag = torch.exp(
+            torch.empty(n_freq).uniform_(math.log(lo), math.log(hi), generator=gen)
+        )
+        dirs = torch.randn(d_in, n_freq, generator=gen)
+        self.register_buffer("W", dirs / dirs.norm(dim=0, keepdim=True) * mag)
+        self.register_buffer("b", torch.rand(n_freq, generator=gen) * 2 * math.pi)
+
+        # off until train_flodr switches it on
+        self.eps, self.on = float(eps), False
+        self.high = torch.nn.Sequential(
+            torch.nn.Linear(2 * n_freq, hid),
+            torch.nn.Tanh(),
+            torch.nn.Linear(hid, d_out),
+        )
+
+        with torch.no_grad():
+            self.high[-1].weight.mul_(0.0)
+            self.high[-1].bias.mul_(0.0)
+
+    def forward(self, x):
+        out = _mlp(self.base, x)
+
+        if not self.on:
+            return out
+
+        # the phase reaches |f| ~ 20, where a bf16 step is 0.125 rad
+        if Coupling.fp32_head:
+            with torch.autocast(x.device.type, enabled=False):
+                f = x.float() @ self.W + self.b
+        else:
+            f = x @ self.W + self.b
+
+        shift = _mlp(self.high, torch.cat([f.cos(), f.sin()], -1)) * self.shift_mask
+
+        return out + self.eps * shift
+
+
 def _fit_y_gmm(Y, ks=(16, 32, 64, 128, 256), seed=0):
     Y = np.asarray(Y, dtype=np.float64)
     rng = np.random.default_rng(seed)
@@ -142,6 +247,10 @@ def _fit_y_gmm(Y, ks=(16, 32, 64, 128, 256), seed=0):
 
         if loglik > best_ll:
             best, best_ll = k, loglik
+
+    # fewer points than the smallest candidate: one component per four points
+    if best is None:
+        best = max(1, len(Y) // 4)
 
     gmm = GaussianMixture(
         best, covariance_type="diag", random_state=seed, reg_covar=1e-6
@@ -187,6 +296,7 @@ class CondBase(torch.nn.Module):
             ("ylogw", "ymu", "ylogvar"), _fit_y_gmm(Y, ks=ks, seed=seed)
         ):
             self.register_buffer(name, val.to(dev))
+
         return self
 
     def y_log_prob(self, y):
@@ -226,14 +336,24 @@ class Flow(torch.nn.Module):
         shallow=False,
         sketch_head=0,
         gate_max=0.0,
+        gate_display=0.0,
         k=2,
     ):
         super().__init__()
         layers = []
+        res = torch.arange(k, d)
 
+        # alternating masks, so every second layer writes the display from the residual
+        # and the others write half the residual. a random draw can miss a display axis
         for i in range(n_layers):
             mask = torch.zeros(d)
-            mask[torch.randperm(d)[: d // 2]] = 1.0
+
+            if (i + 1) % 2 == 0:
+                mask[k:] = 1.0
+            else:
+                mask[:k] = 1.0
+                mask[res[(i // 2) % 2 :: 2]] = 1.0
+
             layers.append(
                 Coupling(
                     d,
@@ -244,15 +364,19 @@ class Flow(torch.nn.Module):
                     shallow=shallow,
                     sketch_head=sketch_head,
                     gate_max=gate_max,
+                    gate_display=gate_display,
+                    k=k,
                 )
             )
 
         self.layers = torch.nn.ModuleList(layers)
+
         # y-conditioned couplings, see fit_cond_tail
         self.tail = torch.nn.ModuleList()
 
         # CondBase, set by fit_cond_tail
         self._cond = None
+
         # set by train_flodr for lazy density fitting
         self._density_args = None
         self.base_logvar = torch.nn.Parameter(torch.zeros(d))
@@ -306,6 +430,7 @@ class Flow(torch.nn.Module):
 
         return z
 
+    @_few_threads
     def fit_cond_tail(
         self,
         x,
@@ -341,6 +466,7 @@ class Flow(torch.nn.Module):
 
         for _ in range(n_tail):
             mask = torch.zeros(d)
+
             # y always in the conditioning (identity) set
             mask[:k] = 1.0
             mask[k + torch.randperm(d - k)[: (d - k) // 2]] = 1.0
@@ -411,6 +537,7 @@ class Flow(torch.nn.Module):
 
         return self
 
+    @_few_threads
     def fit_cond_tail_cv(
         self,
         x,
@@ -445,6 +572,7 @@ class Flow(torch.nn.Module):
                 for layer in self.layers:
                     z, ld_layer = layer.forward_logdet(z)
                     logdet = logdet + ld_layer
+
                 return z, logdet
 
             z_tr, ld_tr = _main_latents(x_all[tr_idx])
@@ -477,6 +605,7 @@ class Flow(torch.nn.Module):
                 for layer in cand_flow.tail:
                     z, ld_layer = layer.forward_logdet(z)
                     logdet = logdet + ld_layer
+
                 nll = -float((cand_flow.base_log_prob(z) + logdet).mean()) / cand_flow.d
 
             if nll < best_v:
@@ -597,6 +726,7 @@ class Flow(torch.nn.Module):
 
                 lb = lb_new
                 weights, means, cov = m_step((log_p - loglik).T.exp())
+
             w_chol = prec_chol(cov)
 
         dev = z32.device
@@ -617,6 +747,7 @@ class Flow(torch.nn.Module):
         if self.gmm_logw is not None:
             y = torch.einsum("nd,kde->kne", z, self.gmm_W) - self.gmm_muW[:, None, :]
             log_p = -0.5 * ((y**2).sum(-1) + self.d * l2pi) + self.gmm_logdet[:, None]
+
             return torch.logsumexp(self.gmm_logw[:, None] + log_p, 0)
 
         return -0.5 * (

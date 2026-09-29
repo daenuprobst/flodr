@@ -1,6 +1,6 @@
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
 from matplotlib.colors import to_rgb
 from scipy.spatial import cKDTree
 

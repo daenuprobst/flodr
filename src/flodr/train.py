@@ -8,7 +8,7 @@ import numpy as np
 import torch
 
 from .data import find_ab
-from .model import Flow
+from .model import Coupling, Flow, FourierShift
 
 # deterministic GEMM workspace, needed before the first cuBLAS handle exists
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -136,6 +136,10 @@ class Muon(torch.optim.Optimizer):
                     )
 
 
+# largest edge batch for edge_batch=-1, below it the graph is taken whole
+EDGE_BATCH_CAP = 262_144
+
+
 @dataclass
 class TrainConfig:
     iters: int = 700
@@ -174,7 +178,8 @@ class TrainConfig:
     aux_batch: int = 512
     # trailing fraction of iters run full-batch
     aux_full_frac: float = 0.2
-    # kNN edges per iter (0 = full batch), no cudagraphs
+    # kNN edges per iter (0 = full batch, -1 = full batch up to EDGE_BATCH_CAP edges and
+    # capped above), no cudagraphs when batched
     edge_batch: int = 0
     # couplings of the post-hoc conditional density tail
     cond_tail: int = 2
@@ -203,6 +208,12 @@ class TrainConfig:
     onecycle: bool = False
     # torch.compile(step) on CPU, not for edge_batch
     cpu_compile: bool = False
+    # torch.compile the edge-batched loss on CUDA; the draws stay eager
+    compile_edges: bool = False
+    # "bf16" or "fp16" hidden layers on the edge-batched step, output layers and Fourier
+    # phase in fp32; fp16 with loss scaling. bf16 with compile_edges is 2.3x faster than fp32
+    # eager for 2.5-3.5% recall and a weaker spread r2
+    half_edges: str = ""
     # bf16 matmuls while training, fp32 everywhere else
     bf16: bool = False
     # "adam" | "nadam" | "lion" (lr ~1e-4) | "muon" (lr ~0.02)
@@ -213,6 +224,16 @@ class TrainConfig:
     shallow: bool = False
     # >0 bounds |log scale| per coupling
     gate_max: float = 0.0
+    # >0 makes the bound per dim, this on the display and gate_max on the residual
+    gate_display: float = 0.0
+    # FloDR pads narrower inputs with unit-variance noise columns up to this width, the
+    # graph and the stress stay on X
+    pad: int = 0
+    # >0 adds a FourierShift to the couplings that write the display, at this weight
+    fine_eps: float = 0.0
+    # its own Adam step size, and the fraction of iters before it switches on
+    fine_lr: float = 1e-3
+    fine_start: float = 0.5
     seed: int = 0
 
 
@@ -221,14 +242,14 @@ def raw_recipe(seed=0, threads=None, **overrides):
     if threads is None:
         threads = 0 if dev.startswith("cuda") else perf_cores()
 
-    # 400 iters under-trains past n~50k. 800 is the smallest budget that holds the
-    # recall margin over UMAP, and more is non-monotone within the seed scatter
+    # with the density term on, 6400 iters at lr 0.0025, pad and fine_eps reach
+    # recall@15 0.138 on a 250k-cell 10-D scPoli latent (UMAP 0.102)
     kw = dict(
         seed=seed,
         threads=threads,
         sketch=64,
         onecycle=True,
-        iters=800,
+        iters=6400,
         aux_full_frac=0.05,
         w_nll=0.0,
         cond_tail=0,
@@ -236,12 +257,32 @@ def raw_recipe(seed=0, threads=None, **overrides):
         # 17x penalty if bf16 is emulated rather than native
         bf16=native_bf16(dev),
         optim="muon",
-        lr=0.02,
+        lr=0.0025,
         w_rep=15.0,
         # raw mode defers recon anyway
         w_recon=0.0,
+        neg=48,
+        warmup_frac=0.05,
+        edge_batch=-1,
+        gate_max=0.5,
+        gate_display=1.0,
+        pad=30,
+        fine_eps=0.25,
+        # 1.4x faster at 250k cells (-0.6% recall), 1.65x at 103k (same recall)
+        compile_edges=True,
+        # another 1.3-1.5x at the same recall and certificates; bf16 lost 2.5-3.5%
+        half_edges="fp16",
     )
     kw.update(overrides)
+
+    # an iters override keeps lr * iters = 16, since Muon's step is magnitude-blind, and
+    # the Fourier branch's fine_lr * iters = 6.4 so it is not left half trained. below 800
+    # iters both stay at their 800-iter values: at 40 iters and lr 0.4 the round trip was 0.16
+    if "iters" in overrides and "lr" not in overrides:
+        kw["lr"] = min(16.0 / kw["iters"], 0.02)
+
+    if "iters" in overrides and "fine_lr" not in overrides:
+        kw["fine_lr"] = min(6.4 / kw["iters"], 0.008)
 
     return TrainConfig(**kw)
 
@@ -288,9 +329,31 @@ def train_flodr(
         act=cfg.act,
         sketch_head=cfg.sketch_head,
         gate_max=cfg.gate_max,
+        gate_display=cfg.gate_display,
         shallow=cfg.shallow,
         k=k,
-    ).to(dev)
+    )
+    fine = []
+
+    if cfg.fine_eps:
+        gen_fine = torch.Generator().manual_seed(cfg.seed + 9000)
+
+        # only the couplings that write the display and nothing else
+        for layer in flow.layers:
+            free = 1 - layer.mask
+
+            if bool(free[:k].all()) and not bool(free[k:].any()):
+                fine.append(layer)
+
+        for layer in fine:
+            d_in = layer.S.shape[0] if layer.S is not None else D
+            layer.net = FourierShift(
+                layer.net, d_in, cfg.hid, 2 * D, eps=cfg.fine_eps, gen=gen_fine
+            )
+
+        fine = [layer.net for layer in flow.layers if isinstance(layer.net, FourierShift)]
+
+    flow = flow.to(dev)
 
     if y_init is not None and cfg.init_iters:
         y_init_t = torch.from_numpy(np.asarray(y_init)).float().to(dev)
@@ -308,14 +371,18 @@ def train_flodr(
             loss_ws.backward()
             opt_init.step()
 
+    # the Fourier branch trains under Adam at its own step, the rest under cfg.optim
+    fine_params = [p for m in fine for p in m.high.parameters()]
+    fine_ids = {id(p) for p in fine_params}
+    params = [p for p in flow.parameters() if id(p) not in fine_ids]
+
     opt = {
-        "adam": lambda: torch.optim.Adam(
-            flow.parameters(), lr=cfg.lr, fused=dev.type == "cuda"
-        ),
-        "nadam": lambda: torch.optim.NAdam(flow.parameters(), lr=cfg.lr),
-        "lion": lambda: Lion(flow.parameters(), lr=cfg.lr),
-        "muon": lambda: Muon(flow.parameters(), lr=cfg.lr),
+        "adam": lambda: torch.optim.Adam(params, lr=cfg.lr, fused=dev.type == "cuda"),
+        "nadam": lambda: torch.optim.NAdam(params, lr=cfg.lr),
+        "lion": lambda: Lion(params, lr=cfg.lr),
+        "muon": lambda: Muon(params, lr=cfg.lr),
     }[cfg.optim]()
+    opt_fine = torch.optim.Adam(fine_params, lr=cfg.fine_lr) if fine else None
 
     n_edges = edge_i.shape[0]
 
@@ -533,63 +600,76 @@ def train_flodr(
             + cfg.w_jac * L_jac
         )
 
-    def step_edge_batch(edge_idx, keep, ramp):
+    # every draw of a step, in the order the loss used to make them, so a compiled loss sees
+    # the same indices as the eager one
+    def draw_edge_batch(edge_idx):
         pts = torch.cat([edge_i[edge_idx], edge_j[edge_idx]])
         uniq, inv = torch.unique(pts, return_inverse=True)
 
         n_uniq, n_edge = uniq.shape[0], edge_idx.shape[0]
-        # gather once (was doubled for recon)
-        x_uniq = x_t[uniq]
 
+        def draw(high, size):
+            return torch.randint(0, high, (size,), device=dev, generator=gen)
+
+        neg_a = draw(n_uniq, cfg.neg * n_edge)
+        neg_b = draw(n_uniq, cfg.neg * n_edge)
+        glob_a = draw(n_uniq, 3 * n_uniq)
+        glob_b = draw(n_uniq, 3 * n_uniq)
+        idx_a = idx_b = idx_c = idx_d = mask_a = mask_b = mdist_a = mdist_b = None
+
+        if cfg.w_stress:
+            n_pairs = 4 * n_uniq
+            idx_a, idx_b = draw(n_uniq, n_pairs), draw(n_uniq, n_pairs)
+            row_a, row_b = uniq[idx_a], uniq[idx_b]
+            mask_a = (((row_a + row_b) % 5) != 0).float()
+            mdist_a = _lh(row_a, row_b)
+
+            if cfg.stress_ordinal:
+                idx_c, idx_d = draw(n_uniq, n_pairs), draw(n_uniq, n_pairs)
+                row_c, row_d = uniq[idx_c], uniq[idx_d]
+                mask_b = (((row_c + row_d) % 5) != 0).float()
+                mdist_b = _lh(row_c, row_d)
+
+        rows = draw(n_uniq, min(aux_n, n_uniq))
+        chart_e = draw(n_edge, min(aux_n, n_edge)) if cfg.w_chart else None
+        wa = w_attr[edge_idx] if w_attr is not None else None
+
+        # gather once (was doubled for recon)
+        return (x_t[uniq], inv, pts, wa, neg_a, neg_b, glob_a, glob_b, idx_a, idx_b, idx_c,
+                idx_d, mask_a, mask_b, mdist_a, mdist_b, rows, chart_e)
+
+    def loss_edge_batch(x_uniq, inv, pts, wa, neg_a, neg_b, glob_a, glob_b, idx_a, idx_b,
+                        idx_c, idx_d, mask_a, mask_b, mdist_a, mdist_b, rows, chart_e, keep,
+                        ramp):
+        n_edge = inv.shape[0] // 2
         Z, logdet = flow.forward_with_logdet(x_uniq)
         Y = Z[:, :k]
 
         d2_edge = ((Y[inv[:n_edge]] - Y[inv[n_edge:]]) ** 2).sum(1)
         w_edge = 1.0 / (1.0 + a * (d2_edge + 1e-6) ** b)
 
-        if w_attr is None:
+        if wa is None:
             L_attr = -torch.log(w_edge + 1e-6).mean()
         else:
-            L_attr = (
-                -(w_attr[edge_idx] * torch.log(w_edge + 1e-6)).sum()
-                / w_attr[edge_idx].sum()
-            )
-
-        neg_a = torch.randint(0, n_uniq, (cfg.neg * n_edge,), device=dev, generator=gen)
-        neg_b = torch.randint(0, n_uniq, (cfg.neg * n_edge,), device=dev, generator=gen)
+            L_attr = -(wa * torch.log(w_edge + 1e-6)).sum() / wa.sum()
 
         d2_neg = ((Y[neg_a] - Y[neg_b]) ** 2).sum(1)
         w_neg = 1.0 / (1.0 + a * (d2_neg + 1e-6) ** b)
 
         L_rep = -torch.log(1.0 - w_neg + 1e-6).mean()
 
-        glob_a = torch.randint(0, n_uniq, (3 * n_uniq,), device=dev, generator=gen)
-        glob_b = torch.randint(0, n_uniq, (3 * n_uniq,), device=dev, generator=gen)
         d2_glob = ((Y[glob_a] - Y[glob_b]) ** 2).sum(1)
         L_glob = (d2_glob / (1.0 + d2_glob)).mean()
 
         if cfg.w_stress:
-            n_pairs = 4 * n_uniq
-            idx_a = torch.randint(0, n_uniq, (n_pairs,), device=dev, generator=gen)
-            idx_b = torch.randint(0, n_uniq, (n_pairs,), device=dev, generator=gen)
-            row_a, row_b = uniq[idx_a], uniq[idx_b]
-            mask_a = (((row_a + row_b) % 5) != 0).float()
-
             ldist_a = 0.5 * torch.log(
                 ((Y[idx_a] - Y[idx_b]) ** 2).sum(1).clamp_min(1e-12)
             )
 
-            mdist_a = _lh(row_a, row_b)
-
             if cfg.stress_ordinal:
-                idx_c = torch.randint(0, n_uniq, (n_pairs,), device=dev, generator=gen)
-                idx_d = torch.randint(0, n_uniq, (n_pairs,), device=dev, generator=gen)
-                row_c, row_d = uniq[idx_c], uniq[idx_d]
-                mask_b = (((row_c + row_d) % 5) != 0).float()
                 ldist_b = 0.5 * torch.log(
                     ((Y[idx_c] - Y[idx_d]) ** 2).sum(1).clamp_min(1e-12)
                 )
-                mdist_b = _lh(row_c, row_d)
                 sign = torch.sign(mdist_b - mdist_a)
                 hinge = torch.relu(sign * (ldist_a - ldist_b) + 0.1)
                 mask = mask_a * mask_b
@@ -603,31 +683,30 @@ def train_flodr(
         else:
             L_stress = 0.0
 
-        rows = torch.randint(
-            0, n_uniq, (min(aux_n, n_uniq),), device=dev, generator=gen
-        )
-
         z_sub, logdet_s = Z[rows], logdet[rows]
-        y_head = z_sub[:, :k].detach() if cfg.recon_detach else z_sub[:, :k]
-        z_trunc = torch.cat([y_head, z_sub[:, k:]], 1) * keep
 
-        if cfg.checkpoint:
-            x_rec = z_trunc
+        # gated as in step
+        if cfg.w_recon:
+            y_head = z_sub[:, :k].detach() if cfg.recon_detach else z_sub[:, :k]
+            z_trunc = torch.cat([y_head, z_sub[:, k:]], 1) * keep
 
-            for c in reversed(flow.layers):
-                x_rec = torch.utils.checkpoint.checkpoint(
-                    c.inverse, x_rec, use_reentrant=False
-                )
+            if cfg.checkpoint:
+                x_rec = z_trunc
+
+                for c in reversed(flow.layers):
+                    x_rec = torch.utils.checkpoint.checkpoint(
+                        c.inverse, x_rec, use_reentrant=False
+                    )
+            else:
+                x_rec = flow.inverse(z_trunc)
+
+            L_recon = ((x_rec - x_uniq[rows]) ** 2).mean()
         else:
-            x_rec = flow.inverse(z_trunc)
+            L_recon = 0.0
 
-        L_recon = ((x_rec - x_uniq[rows]) ** 2).mean()
         L_nll = -(flow.base_log_prob(z_sub) + logdet_s).mean() / D if cfg.w_nll else 0.0
 
         if cfg.w_chart:
-            chart_e = torch.randint(
-                0, n_edge, (min(aux_n, n_edge),), device=dev, generator=gen
-            )
             z_mix = torch.cat(
                 [Z[inv[n_edge:][chart_e], :k], Z[inv[:n_edge][chart_e], k:]], 1
             )
@@ -648,12 +727,32 @@ def train_flodr(
             )
         )
 
+    compiled_edges = (
+        cfg.compile_edges and dev.type == "cuda" and not (cfg.w_recon or cfg.w_chart)
+    )
+
+    if compiled_edges:
+        # shapes change every step, so dynamic. one recompile when the Fourier branch switches
+        # on, and the atomic scatters in backward are not bitwise reproducible across runs
+        loss_edge_batch = torch.compile(loss_edge_batch, dynamic=True)
+
+    def step_edge_batch(edge_idx, keep, ramp):
+        if compiled_edges:
+            ramp = torch.tensor(ramp, dtype=torch.float32, device=dev)
+
+        return loss_edge_batch(*draw_edge_batch(edge_idx), keep, ramp)
+
+    if cfg.edge_batch < 0:
+        eb_size = EDGE_BATCH_CAP if n_edges > EDGE_BATCH_CAP else 0
+    else:
+        eb_size = min(cfg.edge_batch, n_edges) if cfg.edge_batch else 0
+
     use_graphs = cfg.cudagraphs
 
     if use_graphs is None:
-        use_graphs = dev.type == "cuda" and n * D >= 5_000_000 and not cfg.edge_batch
+        use_graphs = dev.type == "cuda" and n * D >= 5_000_000 and not eb_size
 
-    compiled = use_graphs or (cfg.cpu_compile and not cfg.edge_batch)
+    compiled = use_graphs or (cfg.cpu_compile and not eb_size)
 
     if use_graphs:
         torch.use_deterministic_algorithms(True, warn_only=True)
@@ -693,7 +792,13 @@ def train_flodr(
             0, n, (size,), device=dev, dtype=torch.int32, generator=gen
         )
 
-    eb_size = min(cfg.edge_batch, n_edges) if cfg.edge_batch else 0
+    # fp16 on CUDA only, bf16 where it is native
+    fp16 = cfg.half_edges == "fp16" and dev.type == "cuda"
+    half_dtype = torch.float16 if fp16 else torch.bfloat16
+    half_on = fp16 or (cfg.half_edges == "bf16" and cfg.bf16)
+    Coupling.fp32_head = half_on and bool(eb_size)
+    # a no-op unless fp16: scale, unscale_ and update pass through, step calls opt.step
+    scaler = torch.amp.GradScaler(dev.type, enabled=fp16 and bool(eb_size))
 
     steps = range(cfg.iters)
 
@@ -711,9 +816,16 @@ def train_flodr(
         cut = int(rng.choice(cuts))
         keep = (dim_idx < cut).to(torch.float32)
 
+        for m in fine:
+            m.on = it >= cfg.fine_start * cfg.iters
+
+        # the branch has no gradients before it switches on, and the scaler needs some
+        fine_on = opt_fine is not None and fine[0].on
+
         if eb_size:
             edge_idx = torch.randint(0, n_edges, (eb_size,), device=dev, generator=gen)
-            loss = step_edge_batch(edge_idx, keep, ramp)
+            with torch.autocast(dev.type, dtype=half_dtype, enabled=half_on):
+                loss = step_edge_batch(edge_idx, keep, ramp)
         else:
             neg_a, neg_b = _ri(cfg.neg * n_edges), _ri(cfg.neg * n_edges)
             glob_a, glob_b = _ri(3 * n), _ri(3 * n)
@@ -780,9 +892,23 @@ def train_flodr(
                 )
 
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+
+        if opt_fine is not None:
+            opt_fine.zero_grad(set_to_none=True)
+
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)
+
+        if fine_on:
+            scaler.unscale_(opt_fine)
+
         torch.nn.utils.clip_grad_norm_(flow.parameters(), 5.0)
-        opt.step()
+        scaler.step(opt)
+
+        if fine_on:
+            scaler.step(opt_fine)
+
+        scaler.update()
 
         if sched is not None:
             sched.step()
