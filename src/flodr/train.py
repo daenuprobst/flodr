@@ -351,7 +351,9 @@ def train_flodr(
                 layer.net, d_in, cfg.hid, 2 * D, eps=cfg.fine_eps, gen=gen_fine
             )
 
-        fine = [layer.net for layer in flow.layers if isinstance(layer.net, FourierShift)]
+        fine = [
+            layer.net for layer in flow.layers if isinstance(layer.net, FourierShift)
+        ]
 
     flow = flow.to(dev)
 
@@ -423,7 +425,6 @@ def train_flodr(
         gen_hold.manual_seed(cfg.seed + 90210)
         held = torch.rand(n_edges, generator=gen_hold) < cfg.jac_hold
         jac_pool = torch.nonzero(~held).squeeze(1).to(dev)
-        jac_held = torch.nonzero(held).squeeze(1).to(dev)
 
         if cfg.jac_mode == "centered":
             ei_np = edge_i.detach().cpu().numpy().astype(np.int64)
@@ -443,7 +444,7 @@ def train_flodr(
                 torch.as_tensor(mask, device=dev),
             )
     else:
-        jac_pool = jac_held = None
+        jac_pool = None
 
     def _jac_terms(jac_sel):
         pair_i, pair_j = edge_i[jac_sel].long(), edge_j[jac_sel].long()
@@ -635,12 +636,49 @@ def train_flodr(
         wa = w_attr[edge_idx] if w_attr is not None else None
 
         # gather once (was doubled for recon)
-        return (x_t[uniq], inv, pts, wa, neg_a, neg_b, glob_a, glob_b, idx_a, idx_b, idx_c,
-                idx_d, mask_a, mask_b, mdist_a, mdist_b, rows, chart_e)
+        return (
+            x_t[uniq],
+            inv,
+            pts,
+            wa,
+            neg_a,
+            neg_b,
+            glob_a,
+            glob_b,
+            idx_a,
+            idx_b,
+            idx_c,
+            idx_d,
+            mask_a,
+            mask_b,
+            mdist_a,
+            mdist_b,
+            rows,
+            chart_e,
+        )
 
-    def loss_edge_batch(x_uniq, inv, pts, wa, neg_a, neg_b, glob_a, glob_b, idx_a, idx_b,
-                        idx_c, idx_d, mask_a, mask_b, mdist_a, mdist_b, rows, chart_e, keep,
-                        ramp):
+    def loss_edge_batch(
+        x_uniq,
+        inv,
+        pts,
+        wa,
+        neg_a,
+        neg_b,
+        glob_a,
+        glob_b,
+        idx_a,
+        idx_b,
+        idx_c,
+        idx_d,
+        mask_a,
+        mask_b,
+        mdist_a,
+        mdist_b,
+        rows,
+        chart_e,
+        keep,
+        ramp,
+    ):
         n_edge = inv.shape[0] // 2
         Z, logdet = flow.forward_with_logdet(x_uniq)
         Y = Z[:, :k]
@@ -766,9 +804,11 @@ def train_flodr(
         # ramp enters the graph as a tensor, a fresh python float would recompile every iter
         ramps = torch.tensor(
             [
-                1.0
-                if cfg.warmup_frac <= 0
-                else min(1.0, (i + 1) / (cfg.warmup_frac * cfg.iters))
+                (
+                    1.0
+                    if cfg.warmup_frac <= 0
+                    else min(1.0, (i + 1) / (cfg.warmup_frac * cfg.iters))
+                )
                 for i in range(cfg.iters)
             ],
             dtype=torch.float32,

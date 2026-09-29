@@ -13,8 +13,8 @@ jobs:
       matrix:
         python: ["3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
         with:
           enable-cache: true
       - run: uv python install ${{ matrix.python }}
@@ -24,6 +24,8 @@ jobs:
         run: |
           uv sync --extra dev --no-install-package torch --python ${{ matrix.python }}
           uv pip install "torch>=2.1" --index-url https://download.pytorch.org/whl/cpu
+      - name: Format
+        run: uv run black --check src tests scripts
       - name: Lint
         run: uv run ruff check src tests
       - name: Tests
@@ -32,8 +34,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10
       - run: uv python install 3.12
       - name: Build the sdist and wheel, install the wheel in a fresh environment, import it
         run: |
