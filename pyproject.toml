@@ -36,6 +36,7 @@ paper = [
     # HNOCA: range-reads obsm out of the remote h5ad
     "fsspec>=2024.2",
     "aiohttp>=3.9",
+    "h5py>=3.10",
     "pillow>=10.0",
 ]
 
