@@ -7,13 +7,14 @@ import pickle
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 from sklearn.base import clone
 from sklearn.exceptions import NotFittedError
 from sklearn.model_selection import GridSearchCV
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
-from flodr import FloDR, TrainConfig, raw_recipe
+from flodr import FloDR, raw_recipe
 
 N, ITERS = 500, 40
 
@@ -58,9 +59,6 @@ def test_budget_rescales_step_size():
     c = raw_recipe(iters=100)
     assert c.lr == pytest.approx(0.02) and c.fine_lr == pytest.approx(0.008)
     assert raw_recipe(iters=800, lr=0.01).lr == 0.01
-    assert not hasattr(TrainConfig(), "fine_last") and not hasattr(
-        TrainConfig(), "freeze_at"
-    )
 
 
 def test_fit(fitted):
@@ -95,6 +93,110 @@ def test_density(fitted):
     s = m.score_samples(X[:50])
     assert s.shape == (50,) and np.isfinite(s).all()
     assert m.score(X[:50]) == pytest.approx(s.mean(), abs=1e-3)
+
+
+# the certificates bin the layout and need a dozen cells in several bins, hence the larger fit
+@pytest.fixture(scope="module", params=[40, 10], ids=["wide", "padded"])
+def binned(request):
+    X, lab = blobs(2000, request.param)
+    return short().fit(X), lab
+
+
+# the density is fitted under input noise by default, and its certificate scores noised held-out cells
+def test_density_noise(binned):
+    m, _ = binned
+    assert m.density_sigma_ > 0 and m.flow_._density_noise.shape[0] == m.flow_.d
+    # the density is fitted on first use
+    m.score_samples(blobs(20, m.n_features_in_)[0])
+    assert m.flow_.cond_choice_["noise"] is True
+    assert m.coverage_certificate(n_draws=19)["certifies"] in {
+        "certified",
+        "refused",
+        "undecided",
+    }
+    X, _ = blobs(N, 40)
+    clean = short(advanced={"density_noise": 0.0}).fit(X)
+    assert clean.density_sigma_ == 0.0 and clean.flow_._density_noise is None
+    assert np.isfinite(clean.score_samples(X[:20])).all()
+
+
+# the noise is isotropic in the input but never more than half an axis's own spread, so axes in
+# which the training cells do not vary get almost none
+def test_density_noise_cap():
+    from flodr.estimator import _axis_sd
+
+    X, _ = blobs(N, 40)
+    X[:, 30:] = 1e-4 * np.random.default_rng(1).normal(size=(N, 10))
+    m = short().fit(X)
+    wh = m._raw_of.__self__
+    uncapped = m.density_sigma_ / np.concatenate([wh.head_sd, wh.tail_sd])
+    sd_axis = np.asarray(m._coords, np.float64).std(0)
+    np.testing.assert_allclose(_axis_sd(m._coords), sd_axis, rtol=1e-6)
+    sd = m.flow_._density_noise.cpu().numpy().astype(np.float64)
+    np.testing.assert_allclose(sd, np.minimum(uncapped, 0.5 * sd_axis), rtol=1e-5)
+    # the ten near-constant input columns are the lowest-variance axes, where the cap binds hardest
+    ratio = np.sort(sd / uncapped)
+    assert (ratio[:10] < 1e-2).all()
+
+
+def test_nonfinite_fit_warns(monkeypatch):
+    import flodr.estimator as fe
+
+    real = fe.train_flodr
+
+    def diverged(*a, **kw):
+        Y, roundtrip, recon, flow = real(*a, **kw)
+        Y = np.array(Y)
+        Y[3] = np.nan
+
+        return Y, roundtrip, recon, flow
+
+    monkeypatch.setattr(fe, "train_flodr", diverged)
+    X, _ = blobs(200, 12)
+    with pytest.warns(RuntimeWarning, match="non-finite coordinates for 1 of 200"):
+        short(advanced={"pad": 0}).fit(X)
+
+
+# a NaN gradient born in coupling 0 once the Fourier branch is on reaches only the Muon set; the
+# shared clip used to write it into the Fourier set, whose step went ahead, and every row was NaN
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="no GPU"),
+        ),
+    ],
+)
+def test_nonfinite_gradient_skips_the_step(monkeypatch, device):
+    import flodr.train as ft
+
+    calls = []
+
+    class Poisoned(ft.Flow):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+
+            def hook(g):
+                calls.append(1)
+                poison = len(calls) == 3 * ITERS // 4
+
+                return torch.full_like(g, float("nan")) if poison else g
+
+            self.layers[0].net[0].weight.register_hook(hook)
+
+    monkeypatch.setattr(ft, "Flow", Poisoned)
+    X, _ = blobs(200, 12)
+    m = FloDR(
+        device=device,
+        random_state=0,
+        max_iter=ITERS,
+        verbose=False,
+        advanced={"edge_batch": 256, "compile_edges": False, "threads": 2},
+    ).fit(X)
+    assert len(calls) == ITERS
+    assert np.isfinite(m.embedding_).all()
 
 
 def test_params():
@@ -160,6 +262,8 @@ def test_without_density():
     X, _ = blobs(200, 12)
     m = short(density=False).fit(X)
     assert not hasattr(m, "score") and not hasattr(m, "score_samples")
+    with pytest.raises(ValueError):
+        m.coverage_certificate()
 
 
 def test_sklearn_tools():
@@ -203,3 +307,61 @@ def test_pickle(fitted):
     np.testing.assert_array_equal(back.transform(X[:20]), m.transform(X[:20]))
     np.testing.assert_allclose(back.score_samples(X[:20]), m.score_samples(X[:20]))
     np.testing.assert_array_equal(back.embedding_, m.embedding_)
+
+
+def test_wrapped_raw_coords_fit(monkeypatch):
+    # the paper's rotation control and deterministic padding wrap raw_coords in lambdas; fit used to
+    # read the Whitening off the bound method and failed. The pushed noise must match the rotated
+    # Whitening's own sd, rotated, to float rounding (the map is linear)
+    import flodr.estimator as est_mod
+
+    X, _ = blobs(N, 40)
+    orig = est_mod.raw_coords
+    store = {}
+
+    def rotated(Xin, n_components=50, seed=0):
+        Z, to_raw, to_coords = orig(Xin, n_components, seed)
+        Q = np.linalg.qr(np.random.default_rng(7).normal(size=(Z.shape[1],) * 2))[0]
+        Q = Q.astype(np.float32)
+        wh = to_raw.__self__
+        store["Q"], store["sd"], store["Z"] = Q, (wh.head_sd, wh.tail_sd), Z @ Q
+        return Z @ Q, lambda z: to_raw(np.asarray(z) @ Q.T), lambda x: to_coords(x) @ Q
+
+    monkeypatch.setattr(est_mod, "raw_coords", rotated)
+    m = short().fit(X)
+    assert np.isfinite(m.embedding_).all()
+    sd = m.flow_._density_noise
+    sigma = (
+        m._cfg.density_noise * float(np.median(m.knn_dist_[:, 0])) / np.sqrt(X.shape[1])
+    )
+    want = sigma * np.sqrt(
+        (store["Q"] ** 2 * (1 / np.concatenate(store["sd"]) ** 2)[:, None]).sum(0)
+    )
+    cap = m._FROZEN["density_noise_cap"] * est_mod._axis_sd(store["Z"])
+    np.testing.assert_allclose(sd[: len(want)], np.minimum(want, cap), rtol=1e-4)
+
+
+def test_coverage_tail(fitted):
+    # the share of cells less likely than every draw, beside the verdict, which it does not change
+    m, X, _ = fitted
+    cert = m.coverage_certificate(X[:200], n_draws=19)
+    for part, n_draws in (("fibre", 19), ("map", 20000)):
+        t = cert["tail"][part]
+        assert t["nominal"] == 1 / (n_draws + 1) and t["n"] == 200
+        assert 0 <= t["share"] <= t["upper"] <= 1
+    assert cert["tail"]["fibre"]["share"] == (cert["fibre"]["ranks"] < 1 / 20).mean()
+
+
+# a binary input's graph holds each point's true nearest neighbours; asking sklearn for k + 1 and dropping the
+# first used to lose the nearest one, because kneighbors(None) already leaves the point itself out
+def test_jaccard_self_query_keeps_the_nearest():
+    from sklearn.metrics import pairwise_distances
+
+    from flodr.data import knn_query
+
+    X = np.random.default_rng(0).random((300, 64)) < 0.2
+    d, i = knn_query(X, None, 15, "jaccard")
+    D = pairwise_distances(X, metric="jaccard")
+    np.fill_diagonal(D, np.inf)
+    assert not (i == np.arange(300)[:, None]).any()
+    np.testing.assert_allclose(np.sort(d, 1), np.sort(D, 1)[:, :15])

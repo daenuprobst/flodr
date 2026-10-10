@@ -1,6 +1,8 @@
 import functools
+import math
 import os
 import re
+import warnings
 from dataclasses import dataclass, field
 from typing import Tuple
 
@@ -8,7 +10,7 @@ import numpy as np
 import torch
 
 from .data import find_ab
-from .model import Coupling, Flow, FourierShift
+from .model import Coupling, Flow, FourierShift, deterministic
 
 # deterministic GEMM workspace, needed before the first cuBLAS handle exists
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -48,7 +50,7 @@ def native_bf16(device=None) -> bool:
 
 @functools.lru_cache(maxsize=1)
 def perf_cores() -> int:
-    # Intel hybrid, P-cores only
+    # P-cores only on Intel hybrid CPUs
     cpus = _cpu_list(_read("/sys/devices/cpu_core/cpus"))
 
     if not cpus:
@@ -67,6 +69,29 @@ def perf_cores() -> int:
     }
 
     return max(1, len(groups) if groups else (os.cpu_count() or 2) // 2)
+
+
+def _cgroup_cpus():
+    # cgroup v2 cpu.max holds "quota period", or "max period" without a limit
+    try:
+        quota, period = _read("/sys/fs/cgroup/cpu.max").split()[:2]
+        return max(1, math.ceil(int(quota) / int(period)))
+    except ValueError:
+        return None
+
+
+def default_threads():
+    counts = [perf_cores(), torch.get_num_threads(), _cgroup_cpus() or perf_cores()]
+
+    if hasattr(os, "sched_getaffinity"):
+        counts.append(len(os.sched_getaffinity(0)))
+
+    omp = os.environ.get("OMP_NUM_THREADS", "").strip()
+
+    if omp.isdigit() and int(omp) > 0:
+        counts.append(int(omp))
+
+    return max(1, min(counts))
 
 
 class Lion(torch.optim.Optimizer):
@@ -105,12 +130,31 @@ def _ns5(G):
     return X.T if transposed else X
 
 
+def _ns5_stack(G):
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = G / (G.norm(dim=(1, 2), keepdim=True) + 1e-7)
+    transposed = X.shape[1] > X.shape[2]
+    X = X.mT if transposed else X
+
+    for _ in range(5):
+        A = X @ X.mT
+        X = torch.baddbmm(X, torch.baddbmm(A, A, A, beta=b, alpha=c), X, beta=a)
+
+    return X.mT if transposed else X
+
+
+def _kept(ok, x, other=0.0):
+    return x if ok is None else torch.where(ok, x, other)
+
+
 class Muon(torch.optim.Optimizer):
     def __init__(self, params, lr=0.02, momentum=0.95, adam_ratio=0.05):
         super().__init__(params, dict(lr=lr, momentum=momentum, adam_ratio=adam_ratio))
 
+    # ok, a device bool, skips the step where False without a host sync; where True the
+    # arithmetic is the plain step's, bit for bit
     @torch.no_grad()
-    def step(self):
+    def step(self, ok=None):
         for group in self.param_groups:
             for param in group["params"]:
                 if param.grad is None:
@@ -118,22 +162,318 @@ class Muon(torch.optim.Optimizer):
 
                 state = self.state.setdefault(param, {})
                 mom = state.setdefault("m", torch.zeros_like(param))
-                mom.mul_(group["momentum"]).add_(param.grad)
+
+                if ok is None:
+                    new = mom.mul_(group["momentum"]).add_(param.grad)
+                else:
+                    new = mom.mul(group["momentum"]).add_(param.grad)
+                    mom.copy_(torch.where(ok, new, mom))
 
                 if param.ndim == 2:
-                    update = _ns5(mom) * max(
+                    update = _ns5(new) * max(
                         1.0, (param.shape[0] / param.shape[1]) ** 0.5
                     )
-                    param.add_(update, alpha=-group["lr"])
-                # 1D, RMS-normalized momentum step
+                    param.add_(_kept(ok, update), alpha=-group["lr"])
+                # 1-D: an RMS-normalised momentum step
                 else:
                     var = state.setdefault("v", torch.zeros_like(param))
-                    var.mul_(0.99).addcmul_(param.grad, param.grad, value=0.01)
+
+                    if ok is None:
+                        var_new = var.mul_(0.99)
+                    else:
+                        var_new = var.mul(0.99)
+
+                    var_new.addcmul_(param.grad, param.grad, value=0.01)
+
+                    if ok is not None:
+                        var.copy_(torch.where(ok, var_new, var))
+
                     param.addcdiv_(
-                        mom,
-                        var.sqrt().add_(1e-8),
+                        _kept(ok, new),
+                        _kept(ok, var_new.sqrt().add_(1e-8), 1.0),
                         value=-group["lr"] * group["adam_ratio"] / 0.05 * 0.05,
                     )
+
+    def _stacks(self):
+        # each state is a view into its shape's moment stack, so the eager and the
+        # graphed step share moments; parameters without a gradient are left out
+        live = [
+            (gi, p)
+            for gi, group in enumerate(self.param_groups)
+            for p in group["params"]
+            if p.grad is not None
+        ]
+        key = tuple(id(p) for _, p in live)
+
+        if getattr(self, "_stacked", (None,))[0] != key:
+            by_shape = {}
+
+            for gi, param in live:
+                by_shape.setdefault((gi, tuple(param.shape)), []).append(param)
+
+            stacked = []
+
+            for (gi, shape), params in by_shape.items():
+                p0 = params[0]
+                M = torch.zeros(
+                    (len(params),) + shape, device=p0.device, dtype=p0.dtype
+                )
+                V = torch.zeros_like(M) if len(shape) == 1 else None
+
+                for i, param in enumerate(params):
+                    state = self.state.setdefault(param, {})
+                    M[i].copy_(state.get("m", M[i]))
+                    state["m"] = M[i]
+
+                    if V is not None:
+                        V[i].copy_(state.get("v", V[i]))
+                        state["v"] = V[i]
+
+                stacked.append((self.param_groups[gi], params, M, V))
+
+            self._stacked = (key, stacked)
+
+        return self._stacked[1]
+
+    # replayed by a CUDA graph: lr and momentum are device tensors filled before each
+    # replay, as a python float would keep its capture value; ok False leaves all as is
+    @torch.no_grad()
+    def step_graph(self, ok, lr, momentum):
+        if len(self.param_groups) != 1:
+            raise RuntimeError("the graphed Muon step takes one parameter group")
+
+        for group, params, M, V in self._stacks():
+            G = torch.where(ok, torch.stack([p.grad for p in params]), 0.0)
+            M.mul_(torch.where(ok, momentum, 1.0)).add_(G)
+
+            if V is None:
+                U = _ns5_stack(M) * max(1.0, (M.shape[1] / M.shape[2]) ** 0.5)
+                rate = lr
+            else:
+                V.mul_(torch.where(ok, 0.99, 1.0)).addcmul_(G, G, value=0.01)
+                U = M / (V.sqrt() + 1e-8)
+                rate = lr * (group["adam_ratio"] / 0.05 * 0.05)
+
+            torch._foreach_add_(params, list((U * (-rate * ok)).unbind(0)))
+
+
+class _Guarded:
+    # steps on a device-side flag without reading it: where ok is False, device state
+    # is put back at once and host state (Adam's step count) once the flag arrives
+    def __init__(self, opt, dev):
+        self.opt = opt
+        self.cuda = dev.type == "cuda"
+        self.flag = torch.ones((), dtype=torch.bool, pin_memory=self.cuda)
+        self.event = torch.cuda.Event() if self.cuda else None
+        self.pending = None
+
+    def settle(self):
+        if self.pending is None:
+            return
+
+        if self.event is not None:
+            self.event.synchronize()
+
+        if not bool(self.flag):
+            for param, host in self.pending:
+                if host is None:
+                    # the step created the state; the optimizer makes it afresh
+                    self.opt.state.pop(param, None)
+                else:
+                    for key, val in host.items():
+                        self.opt.state[param][key].copy_(val)
+
+        self.pending = None
+
+    @torch.no_grad()
+    def step(self, ok):
+        self.settle()
+        # the flag leaves first, so the next settle waits on the clip only
+        self.flag.copy_(ok, non_blocking=self.cuda)
+
+        if self.event is not None:
+            self.event.record()
+
+        params = [
+            p for g in self.opt.param_groups for p in g["params"] if p.grad is not None
+        ]
+        before = []
+
+        for param in params:
+            state = self.opt.state.get(param) or {}
+            saved = {
+                key: val.clone() for key, val in state.items() if torch.is_tensor(val)
+            }
+            before.append((param, param.clone(), saved if state else None))
+
+        self.opt.step()
+        self.pending = []
+
+        for param, old, saved in before:
+            param.copy_(torch.where(ok, param, old))
+            host = {}
+
+            for key, val in self.opt.state[param].items():
+                if not torch.is_tensor(val):
+                    continue
+
+                if val.device != param.device:
+                    if saved is not None:
+                        host[key] = saved[key]
+                elif saved is not None:
+                    val.copy_(torch.where(ok, val, saved[key]))
+
+            self.pending.append((param, host if saved is not None else None))
+
+        if self.event is None:
+            self.settle()
+
+
+# Adam on a device-side step count, which a graph can replay; a skipped step leaves
+# the count, the moments and the parameters as they were
+@torch.no_grad()
+def _adam_graph(opt, ok):
+    for group in opt.param_groups:
+        b1, b2 = group["betas"]
+
+        for param in group["params"]:
+            if param.grad is None:
+                continue
+
+            state = opt.state[param]
+
+            if not state:
+                state.update(
+                    step=torch.zeros((), device=param.device),
+                    exp_avg=torch.zeros_like(param),
+                    exp_avg_sq=torch.zeros_like(param),
+                )
+            elif state["step"].device != param.device:
+                state["step"] = state["step"].to(param.device)
+
+            g = torch.where(ok, param.grad, 0.0)
+            state["step"].add_(ok)
+            state["exp_avg"].lerp_(g, torch.where(ok, 1 - b1, 0.0))
+            state["exp_avg_sq"].mul_(torch.where(ok, b2, 1.0)).addcmul_(
+                g, g, value=1 - b2
+            )
+            bc1 = (1 - b1 ** state["step"]).clamp_min(1e-12)
+            bc2 = (1 - b2 ** state["step"]).clamp_min(1e-12)
+            den = state["exp_avg_sq"].sqrt() / bc2.sqrt() + group["eps"]
+            param.add_(state["exp_avg"] / den * (-group["lr"] / bc1 * ok))
+
+
+def _graphs_to_eager(opt_fine, scaler, scale):
+    # what the graphed step kept on the device goes where the eager one keeps it
+    if opt_fine is not None:
+        for state in opt_fine.state.values():
+            if "step" in state:
+                state["step"] = state["step"].cpu()
+
+    if scale is not None:
+        scaler._scale, scaler._growth_tracker = scale
+
+
+def _padded_unique(pts, cap):
+    # torch.unique(pts, return_inverse=True) padded to cap rows, on the device; past
+    # the cap the ranks are clamped and wrong, and the caller skips that step
+    srt, perm = torch.sort(pts)
+    first = torch.ones_like(srt, dtype=torch.bool)
+    first[1:] = srt[1:] != srt[:-1]
+    rank = torch.cumsum(first, 0) - 1
+    count = rank[-1] + 1
+    rank = rank.clamp_max(cap - 1)
+    uniq = torch.zeros(cap, dtype=pts.dtype, device=pts.device).scatter_(0, rank, srt)
+
+    return uniq, torch.empty_like(rank).scatter_(0, perm, rank), count
+
+
+def _unique_bounds(edge_i, edge_j, n, eb):
+    # a cell is among the endpoints of eb edges with probability 1 - (1 - deg / m)^eb;
+    # the independent-indicator sd overstates the true one (negative correlation)
+    m = edge_i.shape[0]
+    deg = torch.bincount(torch.cat([edge_i, edge_j]), minlength=n).double()
+    p = 1 - (1 - deg / m) ** eb
+    mu, var = float(p.sum()), float((p * (1 - p)).sum())
+
+    return max(1, round(mu)), min(2 * eb, n, math.ceil(mu + 10 * math.sqrt(var)) + 64)
+
+
+def _graphs_on(cfg, dev, flow, lin_on):
+    if (
+        cfg.cudagraphs is False
+        or dev.type != "cuda"
+        or os.environ.get("FLODR_NO_GRAPHS") == "1"
+    ):
+        return False
+
+    # python hooks would run at capture only
+    hooked = any(
+        p._backward_hooks or p._post_accumulate_grad_hooks for p in flow.parameters()
+    ) or any(
+        m._forward_hooks
+        or m._forward_pre_hooks
+        or m._backward_hooks
+        or m._backward_pre_hooks
+        for m in flow.modules()
+    )
+    eager = lin_on or cfg.w_jac or cfg.checkpoint or cfg.optim != "muon" or hooked
+
+    if eager and cfg.cudagraphs:
+        warnings.warn(
+            "cudagraphs=True: the linearity or Jacobian term, checkpointing, an optimizer other "
+            "than Muon or a hook on the flow keeps the step eager",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+    return not eager
+
+
+class _StepGraphs:
+    # one CUDA graph per phase (Fourier branch off or on, full-batch tail); warm-up
+    # and capture are the fit's own steps, and a new phase drops the last graph
+    def __init__(self, body, params, warmup=3):
+        self.body, self.params, self.warmup = body, params, warmup
+        self.key, self.graph, self.done = None, None, 0
+        self.side = torch.cuda.Stream()
+        self.loss = None
+
+    def __call__(self, key):
+        if key == self.key and self.graph is not None:
+            self.graph.replay()
+            return
+
+        if key != self.key:
+            self.key, self.graph, self.done = key, None, 0
+
+        for param in self.params:
+            param.grad = None
+
+        if self.done < self.warmup:
+            self.side.wait_stream(torch.cuda.current_stream())
+
+            with torch.cuda.stream(self.side):
+                self.loss = self.body(*key)
+
+            torch.cuda.current_stream().wait_stream(self.side)
+            self.done += 1
+            return
+
+        graph = torch.cuda.CUDAGraph()
+
+        with torch.cuda.graph(graph):
+            self.loss = self.body(*key)
+
+        # the capture records the step without running it
+        graph.replay()
+        self.graph = graph
+
+    def close(self):
+        self.graph = None
+
+        for param in self.params:
+            param.grad = None
 
 
 # largest edge batch for edge_batch=-1, below it the graph is taken whole
@@ -148,7 +488,6 @@ class TrainConfig:
     lr: float = 1e-3
     # negative samples per edge
     neg: int = 12
-    # output kernel min_dist, smaller packs tighter
     min_dist: float = 0.01
     w_rep: float = 5.0
     w_recon: float = 2.0
@@ -166,7 +505,6 @@ class TrainConfig:
     w_jac: float = 0.0
     # "vec" | "lognorm" (size only) | "centered"
     jac_mode: str = "vec"
-    # kNN edges per iteration for the Jacobian term
     jac_edges: int = 4096
     # fraction of kNN edges permanently held out
     jac_hold: float = 0.0
@@ -179,11 +517,17 @@ class TrainConfig:
     # trailing fraction of iters run full-batch
     aux_full_frac: float = 0.2
     # kNN edges per iter (0 = full batch, -1 = full batch up to EDGE_BATCH_CAP edges and
-    # capped above), no cudagraphs when batched
+    # capped above)
     edge_batch: int = 0
     # couplings of the post-hoc conditional density tail
     cond_tail: int = 2
     cond_iters: int = 1500
+    # input noise for the density, norm about this times the median 1-NN distance
+    # (0 = none); with it the density cannot gain by putting cells on a sheet
+    density_noise: float = 0.5
+    # "energy": tail chosen by the energy certificate on held-out cells; "coverage": by
+    # l-rank coverage, which keeps draws too wide; "auto": energy only with w_lin
+    tail_select: str = "auto"
     # GMM base components, only when cond_tail=0
     gmm_base: int = 20
     # >0 restricts the sketch to the first N dims (the PCA head)
@@ -192,10 +536,12 @@ class TrainConfig:
     sketch: int = 0
     # warm-start iters regressing dims 0-1 onto y_init
     init_iters: int = 0
-    # the GPU where there is one
     device: str = field(default_factory=default_device)
-    # None = auto, cuda and n*D >= 5e6. Not bitwise-eager
+    # the step as one CUDA graph: None = wherever supported, False = eager; not bitwise
+    # equal to eager. FLODR_NO_GRAPHS=1 turns it off too
     cudagraphs: bool = None
+    # torch.compile the full-batch loss inside the graph
+    graph_compile: bool = True
     # checkpoint the recon-inverse pass, less memory, slower
     checkpoint: bool = False
     # embedding dimension
@@ -204,15 +550,14 @@ class TrainConfig:
     cuts: Tuple[int, ...] = (2, 2, 2, 4, 8, 16, 24, 32)
     # torch CPU threads (0 = leave untouched)
     threads: int = 0
-    # OneCycleLR at max_lr = 3*lr, pair with iters ~400
+    # OneCycleLR at max_lr = 3 * lr
     onecycle: bool = False
     # torch.compile(step) on CPU, not for edge_batch
     cpu_compile: bool = False
     # torch.compile the edge-batched loss on CUDA; the draws stay eager
     compile_edges: bool = False
     # "bf16" or "fp16" hidden layers on the edge-batched step, output layers and Fourier
-    # phase in fp32; fp16 with loss scaling. bf16 with compile_edges is 2.3x faster than fp32
-    # eager for 2.5-3.5% recall and a weaker spread r2
+    # phase in fp32; fp16 with loss scaling
     half_edges: str = ""
     # bf16 matmuls while training, fp32 everywhere else
     bf16: bool = False
@@ -234,16 +579,27 @@ class TrainConfig:
     # its own Adam step size, and the fraction of iters before it switches on
     fine_lr: float = 1e-3
     fine_start: float = 0.5
+    # log(1 + rho^2), rho = |F^-1(F(x) + J e) - (x + e)| / |e|, e the density's noise
+    # times h, so the draws are that noise; opt-in as it costs recall; needs noise_sd
+    w_lin: float = 0.0
+    # off until the layout has formed, then a linear ramp over lin_ramp of the iters
+    lin_start: float = 0.5
+    lin_ramp: float = 0.1
+    lin_h: Tuple[float, ...] = (0.5, 1.0)
+    lin_batch: int = 1024
+    # every lin_every-th step at lin_every times the weight: the same push through the
+    # momentum for a fraction of the kernel launches
+    lin_every: int = 2
+    # log(1 + rho^2 / lin_tau^2)
+    lin_tau: float = 1.0
     seed: int = 0
 
 
 def raw_recipe(seed=0, threads=None, **overrides):
     dev = str(overrides.get("device") or default_device())
     if threads is None:
-        threads = 0 if dev.startswith("cuda") else perf_cores()
+        threads = 0 if dev.startswith("cuda") else default_threads()
 
-    # with the density term on, 6400 iters at lr 0.0025, pad and fine_eps reach
-    # recall@15 0.138 on a 250k-cell 10-D scPoli latent (UMAP 0.102)
     kw = dict(
         seed=seed,
         threads=threads,
@@ -254,8 +610,8 @@ def raw_recipe(seed=0, threads=None, **overrides):
         w_nll=0.0,
         cond_tail=0,
         gmm_base=0,
-        # 17x penalty if bf16 is emulated rather than native
-        bf16=native_bf16(dev),
+        # bf16 only reaches the full-batch step; the edge-batched one has half_edges
+        bf16=False,
         optim="muon",
         lr=0.0025,
         w_rep=15.0,
@@ -268,16 +624,13 @@ def raw_recipe(seed=0, threads=None, **overrides):
         gate_display=1.0,
         pad=30,
         fine_eps=0.25,
-        # 1.4x faster at 250k cells (-0.6% recall), 1.65x at 103k (same recall)
         compile_edges=True,
-        # another 1.3-1.5x at the same recall and certificates; bf16 lost 2.5-3.5%
         half_edges="fp16",
     )
     kw.update(overrides)
 
-    # an iters override keeps lr * iters = 16, since Muon's step is magnitude-blind, and
-    # the Fourier branch's fine_lr * iters = 6.4 so it is not left half trained. below 800
-    # iters both stay at their 800-iter values: at 40 iters and lr 0.4 the round trip was 0.16
+    # an iters override keeps lr * iters = 16, as Muon's step is magnitude-blind, and
+    # fine_lr * iters = 6.4; below 800 iters both stay at their 800-iter values
     if "iters" in overrides and "lr" not in overrides:
         kw["lr"] = min(16.0 / kw["iters"], 0.02)
 
@@ -298,13 +651,41 @@ def train_flodr(
     stress_X=None,
     y_init=None,
     progress=False,
+    noise_sd=None,
+):
+    # cfg.threads and deterministic kernels are process-wide, so hold for this fit only
+    if not cfg.threads:
+        return _train_flodr(
+            Xp, ei, ej, cfg, rng, return_model, w, stress_X, y_init, progress, noise_sd
+        )
+
+    prev = torch.get_num_threads()
+    torch.set_num_threads(cfg.threads)
+
+    try:
+        with deterministic():
+            return _train_flodr(
+                Xp,
+                ei,
+                ej,
+                cfg,
+                rng,
+                return_model,
+                w,
+                stress_X,
+                y_init,
+                progress,
+                noise_sd,
+            )
+    finally:
+        torch.set_num_threads(prev)
+
+
+def _train_flodr(
+    Xp, ei, ej, cfg, rng, return_model, w, stress_X, y_init, progress, noise_sd
 ):
     n, D = Xp.shape
     k = cfg.k
-
-    if cfg.threads:
-        torch.set_num_threads(cfg.threads)
-        torch.use_deterministic_algorithms(True, warn_only=True)
 
     torch.manual_seed(cfg.seed)
     dev = torch.device(cfg.device)
@@ -373,7 +754,6 @@ def train_flodr(
             loss_ws.backward()
             opt_init.step()
 
-    # the Fourier branch trains under Adam at its own step, the rest under cfg.optim
     fine_params = [p for m in fine for p in m.high.parameters()]
     fine_ids = {id(p) for p in fine_params}
     params = [p for p in flow.parameters() if id(p) not in fine_ids]
@@ -387,6 +767,42 @@ def train_flodr(
     opt_fine = torch.optim.Adam(fine_params, lr=cfg.fine_lr) if fine else None
 
     n_edges = edge_i.shape[0]
+
+    # its own generator, so every other draw is the one a fit without it makes
+    lin_on = bool(cfg.w_lin) and noise_sd is not None
+
+    if lin_on:
+        lin_sd = torch.as_tensor(np.asarray(noise_sd), dtype=torch.float32, device=dev)
+        lin_h = torch.as_tensor(cfg.lin_h, dtype=torch.float32, device=dev)
+        gen_lin = torch.Generator(device=dev).manual_seed(cfg.seed + 4711)
+        lin_t0 = int(cfg.lin_start * cfg.iters)
+        lin_n = min(cfg.lin_batch, n)
+
+    def lin_loss(it):
+        if it < lin_t0 or it % cfg.lin_every:
+            return None
+
+        ramp_lin = min(1.0, (it - lin_t0 + 1) / max(1.0, cfg.lin_ramp * cfg.iters))
+        x = x_t[torch.randint(0, n, (lin_n,), device=dev, generator=gen_lin)]
+
+        def pick(m):
+            return torch.randint(0, m, (lin_n, 1), device=dev, generator=gen_lin)
+
+        def noise():
+            return lin_sd * torch.randn(x.shape, device=dev, generator=gen_lin)
+
+        # half the cells clean, half with one draw of the noise, one h per cell
+        x = (x + pick(2) * noise()).requires_grad_(True)
+        e = lin_h[pick(len(lin_h))] * noise()
+        T = flow.forward_main(x)
+        # J e by two reverse passes, exact and fewer launches than forward mode in eager
+        a = torch.zeros_like(T, requires_grad=True)
+        g = torch.autograd.grad((T * a).sum(), x, create_graph=True)[0]
+        t = torch.autograd.grad((g * e).sum(), a, create_graph=True)[0]
+        rho2 = ((flow.inverse_main(T + t) - x - e) ** 2).sum(1) / (e**2).sum(1)
+        pen = torch.log1p(rho2 / cfg.lin_tau**2).mean()
+
+        return cfg.w_lin * cfg.lin_every * ramp_lin * pen
 
     x_stress = (
         torch.from_numpy(stress_X).float().to(dev) if stress_X is not None else x_t
@@ -403,7 +819,6 @@ def train_flodr(
         if vals.numel() > 2 or not torch.all((vals == 0) | (vals == 1)):
             raise ValueError("stress_metric='jaccard' needs binary stress_X")
 
-        # |A|, precomputed once
         row_sums = x_stress.sum(1)
 
     def _lh(row_a, row_b):
@@ -520,7 +935,6 @@ def train_flodr(
         rows_ = rows
         z_sub, logdet_s = Z[rows_], logdet[rows_]
 
-        # the inverse pass is 25-35% of the step, so gate it
         if cfg.w_recon:
             y_head = z_sub[:, :k].detach() if cfg.recon_detach else z_sub[:, :k]
             z_trunc = torch.cat([y_head, z_sub[:, k:]], 1) * keep
@@ -552,7 +966,6 @@ def train_flodr(
             with torch.autocast(dev.type, enabled=False):
                 if cfg.jac_mode == "centered":
                     pad_rows, mask_rows = jac_rows
-                    # (M, kmax)
                     pad_sel, mask_sel = (
                         pad_rows[jac_sel],
                         mask_rows[jac_sel],
@@ -601,8 +1014,7 @@ def train_flodr(
             + cfg.w_jac * L_jac
         )
 
-    # every draw of a step, in the order the loss used to make them, so a compiled loss sees
-    # the same indices as the eager one
+    # a step's draws, outside the loss, so a compiled loss sees the eager indices
     def draw_edge_batch(edge_idx):
         pts = torch.cat([edge_i[edge_idx], edge_j[edge_idx]])
         uniq, inv = torch.unique(pts, return_inverse=True)
@@ -635,7 +1047,6 @@ def train_flodr(
         chart_e = draw(n_edge, min(aux_n, n_edge)) if cfg.w_chart else None
         wa = w_attr[edge_idx] if w_attr is not None else None
 
-        # gather once (was doubled for recon)
         return (
             x_t[uniq],
             inv,
@@ -723,7 +1134,6 @@ def train_flodr(
 
         z_sub, logdet_s = Z[rows], logdet[rows]
 
-        # gated as in step
         if cfg.w_recon:
             y_head = z_sub[:, :k].detach() if cfg.recon_detach else z_sub[:, :k]
             z_trunc = torch.cat([y_head, z_sub[:, k:]], 1) * keep
@@ -768,40 +1178,31 @@ def train_flodr(
     compiled_edges = (
         cfg.compile_edges and dev.type == "cuda" and not (cfg.w_recon or cfg.w_chart)
     )
+    loss_edge_eager = loss_edge_batch
 
     if compiled_edges:
-        # shapes change every step, so dynamic. one recompile when the Fourier branch switches
-        # on, and the atomic scatters in backward are not bitwise reproducible across runs
-        loss_edge_batch = torch.compile(loss_edge_batch, dynamic=True)
+        # shapes change every step, so dynamic; the atomic scatters in backward are not
+        # bitwise reproducible across runs
+        loss_edge_eager = torch.compile(loss_edge_batch, dynamic=True)
 
     def step_edge_batch(edge_idx, keep, ramp):
         if compiled_edges:
             ramp = torch.tensor(ramp, dtype=torch.float32, device=dev)
 
-        return loss_edge_batch(*draw_edge_batch(edge_idx), keep, ramp)
+        return loss_edge_eager(*draw_edge_batch(edge_idx), keep, ramp)
 
     if cfg.edge_batch < 0:
         eb_size = EDGE_BATCH_CAP if n_edges > EDGE_BATCH_CAP else 0
     else:
         eb_size = min(cfg.edge_batch, n_edges) if cfg.edge_batch else 0
 
-    use_graphs = cfg.cudagraphs
-
-    if use_graphs is None:
-        use_graphs = dev.type == "cuda" and n * D >= 5_000_000 and not eb_size
-
-    compiled = use_graphs or (cfg.cpu_compile and not eb_size)
-
-    if use_graphs:
-        torch.use_deterministic_algorithms(True, warn_only=True)
-        # compile once per shape, on disk
-        torch._inductor.config.fx_graph_cache = True
-        step = torch.compile(step, mode="reduce-overhead", fullgraph=True)
-    elif compiled:
-        step = torch.compile(step, dynamic=False)
+    graphs = _graphs_on(cfg, dev, flow, lin_on)
+    step_mode = "graph" if graphs else "eager"
+    compiled = cfg.cpu_compile and not eb_size and not graphs
 
     if compiled:
-        # ramp enters the graph as a tensor, a fresh python float would recompile every iter
+        step = torch.compile(step, dynamic=False)
+        # ramp enters as a tensor, as a fresh python float would recompile every iter
         ramps = torch.tensor(
             [
                 (
@@ -832,13 +1233,226 @@ def train_flodr(
             0, n, (size,), device=dev, dtype=torch.int32, generator=gen
         )
 
-    # fp16 on CUDA only, bf16 where it is native
     fp16 = cfg.half_edges == "fp16" and dev.type == "cuda"
     half_dtype = torch.float16 if fp16 else torch.bfloat16
     half_on = fp16 or (cfg.half_edges == "bf16" and cfg.bf16)
     Coupling.fp32_head = half_on and bool(eb_size)
-    # a no-op unless fp16: scale, unscale_ and update pass through, step calls opt.step
+    # a no-op unless fp16: scale, unscale_ and update pass through
     scaler = torch.amp.GradScaler(dev.type, enabled=fp16 and bool(eb_size))
+
+    # the non-finite guard decides on the device: Muon masks its own step, any other
+    # optimizer is put back
+    main_step = opt.step if isinstance(opt, Muon) else _Guarded(opt, dev).step
+    fine_guard = _Guarded(opt_fine, dev) if opt_fine is not None else None
+
+    if graphs:
+        # what changes between replays sits in fixed buffers filled before each: the
+        # draws, the dropout mask, the ramp, and Muon's lr and momentum (OneCycle)
+        lr_t = torch.zeros((), device=dev)
+        mom_t = torch.zeros((), device=dev)
+        ramp_t = torch.zeros((), device=dev)
+        keep_t = torch.zeros(D, device=dev)
+        keeps = {c: (dim_idx < c).to(torch.float32) for c in cuts}
+        rows_used = bool(cfg.w_recon or cfg.w_nll)
+        buf = {}
+
+        if eb_size:
+            # endpoints padded to a fixed count, uniforms scaled by the true count, as
+            # torch.unique's data-dependent size would sync
+            u_mean, u_cap = _unique_bounds(edge_i, edge_j, n, eb_size)
+
+            # float64, as a float32 uniform times a large count favours some indices
+            def uniform(*size):
+                return torch.zeros(size, device=dev, dtype=torch.float64)
+
+            buf.update(
+                neg_a=uniform(cfg.neg * eb_size),
+                neg_b=uniform(cfg.neg * eb_size),
+                glob_a=uniform(3 * u_mean),
+                glob_b=uniform(3 * u_mean),
+                rows=uniform(min(aux_n, u_mean)),
+                pairs=(
+                    uniform(4 if cfg.stress_ordinal else 2, 4 * u_mean)
+                    if cfg.w_stress
+                    else None
+                ),
+                chart_e=uniform(min(aux_n, eb_size)) if cfg.w_chart else None,
+            )
+            edge_idx_t = torch.zeros(eb_size, dtype=torch.int64, device=dev)
+
+            def fill(late):
+                torch.randint(0, n_edges, (eb_size,), generator=gen, out=edge_idx_t)
+
+                for val in buf.values():
+                    if val is not None:
+                        torch.rand(val.shape, generator=gen, out=val)
+
+            def loss_edges_fixed(
+                edge_idx, neg_a, neg_b, glob_a, glob_b, rows, pairs, chart_e, keep, ramp
+            ):
+                pts = torch.cat([edge_i[edge_idx], edge_j[edge_idx]])
+                uniq, inv, n_uniq = _padded_unique(pts, u_cap)
+                n_in = n_uniq.clamp_max(u_cap)
+
+                def pick(u):
+                    return torch.minimum((u * n_in).long(), n_in - 1)
+
+                idx = [None] * 4
+                mask_a = mask_b = mdist_a = mdist_b = None
+
+                if cfg.w_stress:
+                    idx[: len(pairs)] = [pick(u) for u in pairs]
+                    row_a, row_b = uniq[idx[0]], uniq[idx[1]]
+                    mask_a = (((row_a + row_b) % 5) != 0).float()
+                    mdist_a = _lh(row_a, row_b)
+
+                    if cfg.stress_ordinal:
+                        row_c, row_d = uniq[idx[2]], uniq[idx[3]]
+                        mask_b = (((row_c + row_d) % 5) != 0).float()
+                        mdist_b = _lh(row_c, row_d)
+
+                loss = loss_edge_batch(
+                    x_t[uniq],
+                    inv,
+                    pts,
+                    w_attr[edge_idx] if w_attr is not None else None,
+                    pick(neg_a),
+                    pick(neg_b),
+                    pick(glob_a),
+                    pick(glob_b),
+                    *idx,
+                    mask_a,
+                    mask_b,
+                    mdist_a,
+                    mdist_b,
+                    pick(rows),
+                    (
+                        (chart_e * eb_size).long().clamp_max(eb_size - 1)
+                        if chart_e is not None
+                        else None
+                    ),
+                    keep,
+                    ramp,
+                )
+
+                # a batch with more endpoints than the cap is skipped
+                return loss, n_uniq <= u_cap
+
+            loss_fixed = (
+                torch.compile(loss_edges_fixed, dynamic=False, fullgraph=True)
+                if compiled_edges
+                else loss_edges_fixed
+            )
+
+            def graph_loss(late):
+                return loss_fixed(edge_idx_t, *buf.values(), keep_t, ramp_t)
+
+        else:
+
+            def index(size, dtype=torch.int32):
+                return torch.zeros(size, dtype=dtype, device=dev)
+
+            # in the order the eager step draws them, so both see the same indices
+            buf.update(
+                neg_a=index(cfg.neg * n_edges),
+                neg_b=index(cfg.neg * n_edges),
+                glob_a=index(3 * n),
+                glob_b=index(3 * n),
+                rows=index(aux_n),
+            )
+
+            if cfg.w_chart:
+                buf["chart_e"] = index(min(aux_n, n_edges), torch.int64)
+
+            if cfg.w_stress:
+                buf.update(str_a=index(4 * n), str_b=index(4 * n))
+
+                if cfg.stress_ordinal:
+                    buf.update(str_c=index(4 * n), str_d=index(4 * n))
+
+            rows_all = torch.arange(n, device=dev)
+            spare = buf["neg_a"][:1]
+
+            def fill(late):
+                for key, val in buf.items():
+                    if key == "rows" and late:
+                        continue
+
+                    high = n_edges if key == "chart_e" else n
+                    torch.randint(0, high, val.shape, generator=gen, out=val)
+
+            step_fixed = (
+                torch.compile(step, dynamic=False, fullgraph=True)
+                if cfg.graph_compile
+                else step
+            )
+
+            def graph_loss(late):
+                pairs = [buf.get(key, spare) for key in ("str_a", "str_b")]
+                pairs += (
+                    [buf.get(key, spare) for key in ("str_c", "str_d")]
+                    if "str_c" in buf
+                    else [pairs[0][:1]] * 2
+                )
+
+                return (
+                    step_fixed(
+                        buf["neg_a"],
+                        buf["neg_b"],
+                        buf["glob_a"],
+                        buf["glob_b"],
+                        rows_all if late else buf["rows"],
+                        buf.get("chart_e", spare),
+                        keep_t,
+                        ramp_t,
+                        *pairs,
+                        spare,
+                    ),
+                    None,
+                )
+
+        all_params = list(flow.parameters())
+        scale_t = None
+
+        if scaler.is_enabled():
+            # GradScaler's own step reads its inf flag on the host; the graph keeps the
+            # same scale, backoff and growth on the device
+            scale_t = torch.full((), 2.0**16, device=dev)
+            tracker = torch.zeros((), dtype=torch.int32, device=dev)
+            found = torch.zeros((), device=dev)
+
+        def body(fine_on, late):
+            with torch.autocast(
+                dev.type,
+                dtype=half_dtype if eb_size else torch.bfloat16,
+                enabled=half_on if eb_size else cfg.bf16,
+                cache_enabled=False,
+            ):
+                loss, fits = graph_loss(late)
+
+            (loss if scale_t is None else loss * scale_t).backward()
+
+            live = [p for p in all_params if p.grad is not None]
+
+            if scale_t is not None:
+                found.zero_()
+                torch._amp_foreach_non_finite_check_and_unscale_(
+                    [p.grad for p in live], found, scale_t.double().reciprocal().float()
+                )
+
+            total = torch.nn.utils.clip_grad_norm_(live, 5.0, foreach=True)
+            ok = torch.isfinite(total) if fits is None else torch.isfinite(total) & fits
+            opt.step_graph(ok, lr_t, mom_t)
+
+            if fine_on:
+                _adam_graph(opt_fine, ok)
+
+            if scale_t is not None:
+                torch._amp_update_scale_(scale_t, tracker, found, 2.0, 0.5, 2000)
+
+            return loss.detach()
+
+        runner = _StepGraphs(body, all_params)
 
     steps = range(cfg.iters)
 
@@ -854,13 +1468,45 @@ def train_flodr(
             else min(1.0, (it + 1) / (cfg.warmup_frac * cfg.iters))
         )
         cut = int(rng.choice(cuts))
-        keep = (dim_idx < cut).to(torch.float32)
 
         for m in fine:
             m.on = it >= cfg.fine_start * cfg.iters
 
         # the branch has no gradients before it switches on, and the scaler needs some
         fine_on = opt_fine is not None and fine[0].on
+
+        if graphs:
+            late = it >= (1.0 - cfg.aux_full_frac) * cfg.iters and not eb_size
+            fill(late)
+            keep_t.copy_(keeps[cut])
+            ramp_t.fill_(ramp)
+            lr_t.fill_(opt.param_groups[0]["lr"])
+            mom_t.fill_(opt.param_groups[0]["momentum"])
+
+            try:
+                runner((fine_on, late and rows_used))
+            except RuntimeError as err:
+                warnings.warn(
+                    f"the CUDA-graph step failed ({str(err).splitlines()[0][:200]}); "
+                    "the fit continues eager",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                graphs = False
+                step_mode = f"graph to step {it}, then eager"
+                runner.close()
+                _graphs_to_eager(
+                    opt_fine, scaler, None if scale_t is None else (scale_t, tracker)
+                )
+            else:
+                if sched is not None:
+                    # the scheduler wants to see the optimizer's own step called first
+                    opt._opt_called = True
+                    sched.step()
+
+                continue
+
+        keep = (dim_idx < cut).to(torch.float32)
 
         if eb_size:
             edge_idx = torch.randint(0, n_edges, (eb_size,), device=dev, generator=gen)
@@ -870,7 +1516,6 @@ def train_flodr(
             neg_a, neg_b = _ri(cfg.neg * n_edges), _ri(cfg.neg * n_edges)
             glob_a, glob_b = _ri(3 * n), _ri(3 * n)
 
-            # full batch for the last aux_full_frac, once the layout has settled
             if it >= (1.0 - cfg.aux_full_frac) * cfg.iters:
                 rows = torch.arange(n, device=dev)
             else:
@@ -931,6 +1576,13 @@ def train_flodr(
                     jac_sel,
                 )
 
+        # outside autocast, in fp32
+        if lin_on:
+            pen = lin_loss(it)
+
+            if pen is not None:
+                loss = loss + pen
+
         opt.zero_grad(set_to_none=True)
 
         if opt_fine is not None:
@@ -942,16 +1594,31 @@ def train_flodr(
         if fine_on:
             scaler.unscale_(opt_fine)
 
-        torch.nn.utils.clip_grad_norm_(flow.parameters(), 5.0)
-        scaler.step(opt)
+        # a NaN in one parameter set makes the shared clip norm NaN for both, so both
+        # skip; the flag stays on the device, a host read every step stalls queueing
+        total = torch.nn.utils.clip_grad_norm_(flow.parameters(), 5.0)
+        ok = torch.isfinite(total)
+        main_step(ok)
 
         if fine_on:
-            scaler.step(opt_fine)
+            fine_guard.step(ok)
 
         scaler.update()
 
         if sched is not None:
             sched.step()
+
+    if graphs:
+        runner.close()
+
+    # what ran, for the estimator to report
+    flow._step_mode = step_mode
+
+    if fine_guard is not None:
+        fine_guard.settle()
+
+    if hasattr(main_step, "__self__") and isinstance(main_step.__self__, _Guarded):
+        main_step.__self__.settle()
 
     if cfg.cond_tail:
         # deferred to the first density use, or to an explicit fit_density()
@@ -964,11 +1631,10 @@ def train_flodr(
         Y = Z[:, :k].cpu().numpy()
         roundtrip = float(np.abs(flow.inverse(Z).cpu().numpy() - Xp).max())
         scale = np.sqrt((Xp**2).sum(1)).mean()
-        # truncation lives on the main latent, the density tail re-coordinates dims 2 onward
+        # truncation lives on the main latent; the density tail re-coordinates dims k on
         z_main = flow.forward_main(x_t)
         recon = {}
 
-        # the embedding, plus a deeper cut
         for cut_d in sorted({k, min(16, D)}):
             z_cut = z_main.clone()
             z_cut[:, cut_d:] = 0.0

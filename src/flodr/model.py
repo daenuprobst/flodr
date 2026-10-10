@@ -1,7 +1,9 @@
+import contextlib
 import copy
 import functools
 import math
 import os
+import warnings
 
 import numpy as np
 import torch
@@ -9,8 +11,10 @@ from sklearn.cluster import KMeans
 from sklearn.mixture import GaussianMixture
 from threadpoolctl import threadpool_limits
 
-# the tail fits train on a few hundred rows at a time. on a loaded CPU more threads only
-# add barrier waits, 8 ran 3-4x slower than 4 and uncapped pools stalled for minutes
+from .fidelity import _draws, band, energy_ranks, nearest_distance
+
+# the tail fits train on a few hundred rows at a time, where more threads only add
+# barrier waits
 SMALL_FIT_THREADS = 4
 
 
@@ -38,7 +42,7 @@ def graph_loop(iters, draw, body, dev, warmup=3):
             with torch.cuda.graph(graph):
                 body()
 
-            # the capture recorded without executing
+            # the capture records without executing
             graph.replay()
             done += 1
             for _ in range(iters - done):
@@ -55,6 +59,21 @@ def graph_loop(iters, draw, body, dev, warmup=3):
         body()
 
 
+@contextlib.contextmanager
+def deterministic():
+    # the mode is process-wide, so it is put back afterwards
+    prev = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(prev[0], warn_only=prev[1])
+
+
 def _few_threads(fn):
     @functools.wraps(fn)
     def wrapped(self, *args, **kw):
@@ -63,9 +82,9 @@ def _few_threads(fn):
 
         prev = torch.get_num_threads()
 
-        # torch last, since leaving threadpool_limits resets the OpenMP pool torch runs on
+        # torch last, as leaving threadpool_limits resets the OpenMP pool torch runs on
         try:
-            with threadpool_limits(SMALL_FIT_THREADS):
+            with threadpool_limits(SMALL_FIT_THREADS), deterministic():
                 torch.set_num_threads(min(prev, SMALL_FIT_THREADS))
 
                 return fn(self, *args, **kw)
@@ -76,8 +95,8 @@ def _few_threads(fn):
 
 
 def _mlp(net, x):
-    # under autocast the output layer stays fp32: it writes the layout, and bf16 rounds that
-    # at about 3x the 1-NN spacing
+    # under autocast the output layer stays fp32: it writes the layout, and bf16 rounds
+    # that coarser than the 1-NN spacing
     if not (Coupling.fp32_head and torch.is_autocast_enabled(x.device.type)):
         return net(x)
 
@@ -108,7 +127,6 @@ class Coupling(torch.nn.Module):
         self.register_buffer("mask", mask)
         self.gate_max = float(gate_max)
 
-        # per-dim scale bound when >0: gate_display on the first k dims, gate_max after
         gate_vec = None
 
         if gate_display > 0:
@@ -119,13 +137,12 @@ class Coupling(torch.nn.Module):
         self.gate = torch.nn.Parameter(torch.ones(1 if gate_vec is None else d))
         d_out = 2 * d
 
-        # condition on a fixed random projection of the masked dims, since a coupling stays
+        # a fixed random projection of the masked dims is enough, since a coupling stays
         # invertible for any function of the conditioning set
         use_sketch = bool(sketch) and d > sketch
         sketch_m = torch.randn(sketch, d) / d**0.5 if use_sketch else None
 
-        # zeroing the tail columns leaves the conditioner reading only the PCA head,
-        # which starves the null-space per-point fingerprint
+        # reading only the PCA head starves the null-space per-point fingerprint
         if sketch_m is not None and sketch_head:
             sketch_m[:, sketch_head:] = 0.0
 
@@ -140,7 +157,7 @@ class Coupling(torch.nn.Module):
             torch.nn.Linear(d_in, hid), act_cls(), *mid, torch.nn.Linear(hid, d_out)
         )
 
-        # zero the head for a near-identity init
+        # zero head: each coupling starts as the identity
         with torch.no_grad():
             self.net[-1].weight.mul_(0.0)
             self.net[-1].bias.mul_(0.0)
@@ -180,8 +197,7 @@ class Coupling(torch.nn.Module):
 
 
 class FourierShift(torch.nn.Module):
-    # shift-only branch on fixed random frequencies, added to a coupling's conditioner.
-    # the scale is untouched, so the log-det is too
+    # shift only, so the coupling's log-det is untouched
     def __init__(
         self, base, d_in, hid, d_out, n_freq=256, lo=2.0, hi=6.0, eps=0.25, gen=None
     ):
@@ -228,6 +244,60 @@ class FourierShift(torch.nn.Module):
         return out + self.eps * shift
 
 
+# (n_tail, cond_hid, iters, noise_floor, weight_decay[, n_scale]) for
+# fit_cond_tail_cv; under input noise the rows with a floor drop out
+COVERAGE_GRID = (
+    (0, 32, 1500, 0.0, 0.0),
+    (0, 128, 300, 0.0, 0.0),
+    (2, 128, 1500, 0.0, 0.0),
+    (2, 64, 800, 0.05, 1e-3),
+    (2, 128, 800, 0.1, 1e-2),
+    (0, 32, 1500, 0.05, 0.0),
+    (0, 128, 1500, 0.0, 0.0, 20),
+    (0, 64, 800, 0.0, 1e-3, 20),
+)
+# (n_tail, cond_hid, iters, n_scale) for fit_cond_tail_energy; the depth is searched
+# too, since deep tails overfit small samples
+ENERGY_GRID = (
+    (0, 128, 1500, 20),
+    (2, 128, 1500, 20),
+    (4, 256, 3000, 20),
+    (8, 256, 1500, 20),
+    (8, 256, 3000, 20),
+    (8, 256, 6000, 20),
+    (8, 128, 3000, 20),
+)
+
+
+@torch.no_grad()
+def _energy_val(flow, zc, ref, to_in, sd, n_draws, seed, margin, alpha, chunk=25):
+    k, dev = flow.k, zc.device
+    gen = torch.Generator(device=dev).manual_seed(seed + 53)
+    rng = np.random.default_rng(seed + 59)
+    zn = (
+        zc if sd is None else zc + sd * torch.randn(zc.shape, device=dev, generator=gen)
+    )
+    u, es, d_draw = [], [], []
+
+    for i in range(0, len(zn), chunk):
+        z = zn[i : i + chunk]
+        D = _draws(flow, flow.forward_main(z)[:, :k], n_draws, gen, to_in)
+        r, e = energy_ranks(to_in(z), D, rng, scores=True)
+        u.append(r)
+        es.append(e)
+        d_draw.append(nearest_distance(D.reshape(-1, D.shape[-1]), ref).cpu().numpy())
+
+    d_cell = nearest_distance(to_in(zn), ref).cpu().numpy()
+    b = band(np.concatenate(u), margin, alpha)
+
+    return dict(
+        ks=b["ks"],
+        refused=b["passed"] is False,
+        wild=float((np.concatenate(d_draw) > np.quantile(d_cell, 0.99)).mean()),
+        score=float(np.concatenate(es).mean()),
+    )
+
+
 def _fit_y_gmm(Y, ks=(16, 32, 64, 128, 256), seed=0):
     Y = np.asarray(Y, dtype=np.float64)
     rng = np.random.default_rng(seed)
@@ -263,10 +333,33 @@ def _fit_y_gmm(Y, ks=(16, 32, 64, 128, 256), seed=0):
     )
 
 
+# the passes after training run over every cell at once, so outside autograd they go in
+# chunks to bound memory
+_PASS_CHUNK = 131072
+
+
+def _chunked(fn):
+    @functools.wraps(fn)
+    def run(self, x):
+        if torch.is_grad_enabled() or x.shape[0] <= _PASS_CHUNK:
+            return fn(self, x)
+
+        return torch.cat(
+            [
+                fn(self, x[i : i + _PASS_CHUNK])
+                for i in range(0, x.shape[0], _PASS_CHUNK)
+            ]
+        )
+
+    return run
+
+
 class CondBase(torch.nn.Module):
-    def __init__(self, d, hid=128, k=2):
+    def __init__(self, d, hid=128, k=2, n_scale=0, scale_lo=0.2, scale_hi=3.0):
         super().__init__()
         self.k = k
+        self.m = d - k
+        self.n_scale = n_scale
         self.y_mu = torch.nn.Parameter(torch.zeros(k))
         self.y_logvar = torch.nn.Parameter(torch.zeros(k))
 
@@ -275,8 +368,15 @@ class CondBase(torch.nn.Module):
             torch.nn.Tanh(),
             torch.nn.Linear(hid, hid),
             torch.nn.Tanh(),
-            torch.nn.Linear(hid, 2 * (d - k)),
+            torch.nn.Linear(hid, 2 * (d - k) + n_scale),
         )
+
+        # a Gaussian scale mixture on a fixed log grid, weights depending on y, since
+        # affine couplings cannot change the tail class of a Gaussian base
+        if n_scale:
+            self.register_buffer(
+                "log_s", torch.linspace(math.log(scale_lo), math.log(scale_hi), n_scale)
+            )
 
         # start at the unconditional standard normal
         with torch.no_grad():
@@ -285,9 +385,27 @@ class CondBase(torch.nn.Module):
 
     def r_params(self, y):
         out = self.net(y)
-        half = out.shape[1] // 2
+        m = getattr(self, "m", out.shape[1] // 2)
 
-        return out[:, :half], out[:, half:].clamp(-8.0, 8.0)
+        return out[:, :m], out[:, m : 2 * m].clamp(-8.0, 8.0)
+
+    def scale_logw(self, y):
+        if not getattr(self, "n_scale", 0):
+            return None
+
+        return torch.log_softmax(self.net(y)[:, 2 * self.m :], 1)
+
+    def sample_r(self, y, gen):
+        mu, logvar = self.r_params(y)
+        eps = torch.randn(mu.shape, device=y.device, generator=gen)
+        logw = self.scale_logw(y)
+
+        if logw is None:
+            return mu + torch.exp(0.5 * logvar) * eps
+
+        j = torch.multinomial(logw.exp(), 1, generator=gen)[:, 0]
+
+        return mu + torch.exp(0.5 * logvar + self.log_s[j][:, None]) * eps
 
     def fit_y_density(self, Y, ks=(16, 32, 64, 128, 256), seed=0):
         dev = self.y_mu.device
@@ -299,14 +417,13 @@ class CondBase(torch.nn.Module):
 
         return self
 
+    # its (n, K, k) temporaries are too large for every cell at once
+    @_chunked
     def y_log_prob(self, y):
         l2pi = math.log(2 * math.pi)
 
-        # fitted GMM
         if getattr(self, "ylogw", None) is not None:
-            # (n, K, k)
             diff = y[:, None, :] - self.ymu[None, :, :]
-            # (n, K)
             log_p = -0.5 * (
                 diff**2 * torch.exp(-self.ylogvar[None]) + self.ylogvar[None] + l2pi
             ).sum(2)
@@ -320,7 +437,19 @@ class CondBase(torch.nn.Module):
     def log_prob(self, y, r):
         l2pi = math.log(2 * math.pi)
         mu, logvar = self.r_params(y)
-        log_p_r = -0.5 * ((r - mu) ** 2 * torch.exp(-logvar) + logvar + l2pi).sum(1)
+        logw = self.scale_logw(y)
+
+        if logw is None:
+            log_p_r = -0.5 * ((r - mu) ** 2 * torch.exp(-logvar) + logvar + l2pi).sum(1)
+        else:
+            q = ((r - mu) ** 2 * torch.exp(-logvar)).sum(1)
+            per_scale = (
+                -0.5 * q[:, None] * torch.exp(-2 * self.log_s)[None]
+                - self.m * self.log_s[None]
+            )
+            log_p_r = torch.logsumexp(logw + per_scale, 1) - 0.5 * (logvar + l2pi).sum(
+                1
+            )
 
         return self.y_log_prob(y) + log_p_r
 
@@ -344,7 +473,7 @@ class Flow(torch.nn.Module):
         res = torch.arange(k, d)
 
         # alternating masks, so every second layer writes the display from the residual
-        # and the others write half the residual. a random draw can miss a display axis
+        # and the others write half the residual; a random draw can miss a display axis
         for i in range(n_layers):
             mask = torch.zeros(d)
 
@@ -371,26 +500,27 @@ class Flow(torch.nn.Module):
 
         self.layers = torch.nn.ModuleList(layers)
 
-        # y-conditioned couplings, see fit_cond_tail
         self.tail = torch.nn.ModuleList()
 
-        # CondBase, set by fit_cond_tail
         self._cond = None
 
-        # set by train_flodr for lazy density fitting
+        # set by train_flodr for the lazy density fit
         self._density_args = None
+
+        # per-dim sd of the input noise the density is fitted under, set by FloDR.fit
+        self._density_noise = None
         self.base_logvar = torch.nn.Parameter(torch.zeros(d))
         self.d, self.hid, self.k = d, hid, k
 
-        # fit_gmm_base
         for name in ("gmm_logw", "gmm_W", "gmm_muW", "gmm_logdet"):
             self.register_buffer(name, None)
 
+    @_chunked
     def forward(self, x):
         for layer in self.layers:
             x = layer(x)
 
-        # identity on dims 0-1, embedding unchanged
+        # the tail leaves the first k dims, the embedding, unchanged
         for layer in self.tail:
             x = layer(x)
 
@@ -409,6 +539,7 @@ class Flow(torch.nn.Module):
 
         return x, logdet
 
+    @_chunked
     def inverse(self, z):
         for layer in reversed(self.tail):
             z = layer.inverse(z)
@@ -418,17 +549,36 @@ class Flow(torch.nn.Module):
 
         return z
 
+    @_chunked
     def forward_main(self, x):
         for layer in self.layers:
             x = layer(x)
 
         return x
 
+    @_chunked
     def inverse_main(self, z):
         for layer in reversed(self.layers):
             z = layer.inverse(z)
 
         return z
+
+    @torch.no_grad()
+    def _main_latents(self, x):
+        zs, lds = [], []
+
+        for i in range(0, x.shape[0], _PASS_CHUNK):
+            z = x[i : i + _PASS_CHUNK]
+            logdet = z.new_zeros(z.shape[0])
+
+            for layer in self.layers:
+                z, ld_layer = layer.forward_logdet(z)
+                logdet = logdet + ld_layer
+
+            zs.append(z)
+            lds.append(logdet)
+
+        return torch.cat(zs), torch.cat(lds)
 
     @_few_threads
     def fit_cond_tail(
@@ -442,6 +592,7 @@ class Flow(torch.nn.Module):
         seed=0,
         noise_floor=0.0,
         weight_decay=0.0,
+        n_scale=0,
         _latents=None,
         _ydensity=None,
     ):
@@ -473,7 +624,7 @@ class Flow(torch.nn.Module):
             tail.append(Coupling(d, mask, self.hid))
 
         tail.to(dev)
-        cond = CondBase(d, cond_hid, k=k).to(dev)
+        cond = CondBase(d, cond_hid, k=k, n_scale=n_scale).to(dev)
         params = list(tail.parameters()) + list(cond.parameters())
 
         opt = torch.optim.Adam(
@@ -518,8 +669,8 @@ class Flow(torch.nn.Module):
         self._cond = cond
         self._density_args = None
 
-        # p(y) as a GMM, so the density knows where the data is. a single Gaussian will
-        # not do. The main flow is frozen by now.
+        # p(y) as a GMM, as a single Gaussian does not know where the data is; the
+        # main flow is frozen by now
         if _ydensity is not None:
             for name, val in zip(("ylogw", "ymu", "ylogvar"), _ydensity):
                 cond.register_buffer(name, val.to(dev))
@@ -542,15 +693,25 @@ class Flow(torch.nn.Module):
         self,
         x,
         seed=0,
-        grid=(
-            (0, 32, 1500, 0.0, 0.0),
-            (0, 128, 300, 0.0, 0.0),
-            (2, 128, 1500, 0.0, 0.0),
-            (2, 64, 800, 0.05, 1e-3),
-            (2, 128, 800, 0.1, 1e-2),
-            (0, 32, 1500, 0.05, 0.0),
-        ),
+        grid=None,
+        select="coverage",
+        n_draws=99,
+        max_score_cells=2000,
+        noise_sd=None,
+        copies=4,
+        raw=None,
     ):
+        if select == "energy":
+            return self.fit_cond_tail_energy(
+                x,
+                seed=seed,
+                grid=grid or ENERGY_GRID,
+                noise_sd=noise_sd,
+                copies=copies,
+                raw=raw,
+            )
+
+        grid = grid or COVERAGE_GRID
         n = len(x)
         rng = np.random.default_rng(seed)
         perm = rng.permutation(n)
@@ -563,38 +724,51 @@ class Flow(torch.nn.Module):
             device=dev,
         )
 
-        # every candidate shares the frozen main flow, so the latents and the p(y) GMM are
-        # computed once, bitwise identical to recomputing them per candidate
-        with torch.no_grad():
+        # with noise_sd the law is the cells convolved with input noise: fits see noisy
+        # copies, the split stays by cell, and the noise replaces the grid's floor
+        if noise_sd is not None:
+            gen_n = torch.Generator(device=dev).manual_seed(seed + 5)
+            sd = torch.as_tensor(noise_sd, dtype=torch.float32, device=dev)
+            copies = int(np.clip(2_000_000 // max(n, 1), 1, copies))
 
-            def _main_latents(x_in):
-                z, logdet = x_in, x_in.new_zeros(x_in.shape[0])
-                for layer in self.layers:
-                    z, ld_layer = layer.forward_logdet(z)
-                    logdet = logdet + ld_layer
+            def noisy(rows, m):
+                z = x_all[rows].repeat(m, 1)
 
-                return z, logdet
+                return z + sd * torch.randn(z.shape, device=dev, generator=gen_n)
 
-            z_tr, ld_tr = _main_latents(x_all[tr_idx])
-            z_va, ld_va = _main_latents(x_all[va_idx])
+            x_fit, x_val = noisy(tr_idx, copies), noisy(va_idx, 1)
+            x_final = noisy(np.arange(n), copies)
+            grid = tuple(c for c in grid if len(c) < 4 or not c[3])
+        else:
+            x_fit, x_val, x_final = x_all[tr_idx], x_all[va_idx], x
+
+        # the candidates share the frozen main flow, so the latents and the p(y) GMM are
+        # computed once
+        z_tr, ld_tr = self._main_latents(x_fit)
+        z_va, ld_va = self._main_latents(x_val)
 
         y_gmm = _fit_y_gmm(z_tr[:, : self.k].cpu().numpy(), seed=seed)
         best, best_v = None, np.inf
 
         for cand in grid:
-            n_tail, hid, iters, floor, w_decay = (tuple(cand) + (0.0, 0.0))[:5]
+            cand = tuple(cand)
+            n_tail, hid, iters, floor, w_decay, n_scale = (
+                cand + (0.0, 0.0, 0)[len(cand) - 3 :]
+            )[:6]
+            n_scale = int(n_scale)
             cand_flow = copy.deepcopy(self)
             cand_flow._density_args = None
             cand_flow.tail, cand_flow._cond = torch.nn.ModuleList(), None
 
             cand_flow.fit_cond_tail(
-                x[tr_idx],
+                x_fit,
                 n_tail=n_tail,
                 iters=iters,
                 cond_hid=hid,
                 seed=seed,
                 noise_floor=floor,
                 weight_decay=w_decay,
+                n_scale=n_scale,
                 _latents=(z_tr, ld_tr),
                 _ydensity=y_gmm,
             )
@@ -608,10 +782,22 @@ class Flow(torch.nn.Module):
 
                 nll = -float((cand_flow.base_log_prob(z) + logdet).mean()) / cand_flow.d
 
-            if nll < best_v:
-                best, best_v = (n_tail, hid, iters, floor, w_decay), nll
+            # held-out likelihood can prefer a tail whose fibre regions miss new cells,
+            # so coverage ranks the held-out cells among exact fibre draws instead
+            if select == "coverage":
+                u = cand_flow.fibre_ranks(
+                    x_val[:max_score_cells], n_draws=n_draws, seed=seed
+                )
+                score = float(
+                    np.abs(np.sort(u) - (np.arange(len(u)) + 0.5) / len(u)).max()
+                )
+            else:
+                score = nll
 
-        n_tail, hid, iters, floor, w_decay = best
+            if score < best_v:
+                best, best_v = (n_tail, hid, iters, floor, w_decay, n_scale), score
+
+        n_tail, hid, iters, floor, w_decay, n_scale = best
         self._density_args = None
         self.tail, self._cond = torch.nn.ModuleList(), None
         self.cond_choice_ = dict(
@@ -620,24 +806,202 @@ class Flow(torch.nn.Module):
             iters=iters,
             noise_floor=floor,
             weight_decay=w_decay,
-            val_nll=best_v,
+            n_scale=n_scale,
+            select=select,
+            val_score=best_v,
+            noise=noise_sd is not None,
         )
 
+        # the main pass in chunks, which fit_cond_tail's own pass is not
         return self.fit_cond_tail(
-            x,
+            x_final,
             n_tail=n_tail,
             iters=iters,
             cond_hid=hid,
             seed=seed,
             noise_floor=floor,
             weight_decay=w_decay,
+            n_scale=n_scale,
+            _latents=self._main_latents(x_all if noise_sd is None else x_final),
         )
+
+    @_few_threads
+    def fit_cond_tail_energy(
+        self,
+        x,
+        seed=0,
+        grid=ENERGY_GRID,
+        noise_sd=None,
+        copies=4,
+        raw=None,
+        n_val=1000,
+        n_draws=199,
+        margin=0.1,
+        alpha=0.05,
+        precision_margin=0.02,
+    ):
+        # the energy certificate, as l-rank coverage passes draws far too wide;
+        # raw = (A, b) maps these coords to the input units it measures in, z A + b
+        dev = self.base_logvar.device
+        n = len(x)
+        x_all = torch.as_tensor(
+            np.asarray(x.cpu() if torch.is_tensor(x) else x),
+            dtype=torch.float32,
+            device=dev,
+        )
+        perm = np.random.default_rng(seed + 31).permutation(n)
+        tr_idx, va_idx = np.sort(perm[: n // 2]), np.sort(perm[n // 2 :])
+        va_idx = va_idx[
+            np.random.default_rng(seed + 37).choice(
+                len(va_idx), min(n_val, len(va_idx)), replace=False
+            )
+        ]
+        sd = None
+        copies = int(np.clip(2_000_000 // max(n, 1), 1, copies))
+
+        if noise_sd is not None:
+            sd = torch.as_tensor(noise_sd, dtype=torch.float32, device=dev)
+
+        # a fresh generator per call, so the final noise does not depend on the choice
+        def noisy(rows):
+            z = x_all[rows]
+
+            if sd is None:
+                return z
+
+            z = z.repeat(copies, 1)
+            gen = torch.Generator(device=dev).manual_seed(seed + 5)
+
+            return z + sd * torch.randn(z.shape, device=dev, generator=gen)
+
+        if raw is None:
+            to_in = lambda z: z  # noqa: E731
+        else:
+            A, b = (torch.as_tensor(v, dtype=torch.float32, device=dev) for v in raw)
+            to_in = lambda z: z @ A + b  # noqa: E731
+
+        x_fit = noisy(tr_idx)
+        ref = to_in(x_all[tr_idx])
+        z_tr, ld_tr = self._main_latents(x_fit)
+        y_gmm = _fit_y_gmm(z_tr[:, : self.k].cpu().numpy(), seed=seed)
+        rows = []
+
+        for n_tail, hid, iters, n_scale in grid:
+            cand_flow = copy.deepcopy(self)
+            cand_flow._density_args = None
+            cand_flow.tail, cand_flow._cond = torch.nn.ModuleList(), None
+            cand_flow.fit_cond_tail(
+                x_fit,
+                n_tail=n_tail,
+                iters=iters,
+                cond_hid=hid,
+                seed=seed,
+                n_scale=n_scale,
+                _latents=(z_tr, ld_tr),
+                _ydensity=y_gmm,
+            )
+            v = _energy_val(
+                cand_flow, x_all[va_idx], ref, to_in, sd, n_draws, seed, margin, alpha
+            )
+            v.update(cfg=(n_tail, hid, iters, n_scale))
+            v["eligible"] = not v["refused"] and v["wild"] <= 0.01 + precision_margin
+            rows.append(v)
+
+        # the map is fitted on these cells too, so the checks are optimistic
+        best = min([v for v in rows if v["eligible"]] or rows, key=lambda v: v["score"])
+
+        if not best["eligible"]:
+            warnings.warn(
+                "no density tail passed the energy certificate on held-out cells; kept the "
+                "one with the best energy score (cond_choice_['passed'] is False)",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+
+        n_tail, hid, iters, n_scale = best["cfg"]
+        self._density_args = None
+        self.tail, self._cond = torch.nn.ModuleList(), None
+        del z_tr, ld_tr, x_fit
+        x_final = noisy(np.arange(n))
+        self.fit_cond_tail(
+            x_final,
+            n_tail=n_tail,
+            iters=iters,
+            cond_hid=hid,
+            seed=seed,
+            n_scale=n_scale,
+            _latents=self._main_latents(x_final),
+        )
+        self.cond_choice_ = dict(
+            n_tail=n_tail,
+            cond_hid=hid,
+            iters=iters,
+            n_scale=n_scale,
+            select="energy",
+            passed=best["eligible"],
+            val_score=best["score"],
+            val_ks=best["ks"],
+            val_wild=best["wild"],
+            candidates=rows,
+            noise=noise_sd is not None,
+        )
+
+        return self
+
+    @torch.no_grad()
+    def fibre_ranks(self, x, n_draws=199, seed=0, chunk=512):
+        # l ranked among exact draws from the cell's own fibre; randomised ties make
+        # the rank uniform on (0, 1) when the fitted law is right, in finite samples
+        cond = self.cond
+        dev = self.base_logvar.device
+        x = torch.as_tensor(
+            np.asarray(x.cpu() if torch.is_tensor(x) else x),
+            dtype=torch.float32,
+            device=dev,
+        )
+        gen = torch.Generator(device=dev)
+        gen.manual_seed(seed + 31)
+        rng = np.random.default_rng(seed + 37)
+        k = self.k
+
+        def ell(z, logdet):
+            y, r = z[:, :k], z[:, k:]
+            return cond.log_prob(y, r) - cond.y_log_prob(y) + logdet
+
+        out = []
+
+        for start in range(0, x.shape[0], chunk):
+            z, logdet = self.forward_with_logdet(x[start : start + chunk])
+            y = z[:, :k]
+            l_cell = ell(z, logdet)
+            below = torch.zeros_like(l_cell)
+            ties = torch.zeros_like(l_cell)
+
+            for _ in range(n_draws):
+                xm = self.inverse(torch.cat([y, cond.sample_r(y, gen)], 1))
+                l_m = ell(*self.forward_with_logdet(xm))
+                below += (l_m < l_cell).float()
+                ties += (l_m == l_cell).float()
+
+            u = rng.random(len(l_cell))
+            b, t = below.cpu().numpy(), ties.cpu().numpy()
+            out.append((b + u * (t + 1.0)) / (n_draws + 1.0))
+
+        return np.concatenate(out)
 
     @property
     def cond(self):
         if self._cond is None and self._density_args is not None:
-            x, n_tail, iters, seed = self._density_args
-            self.fit_cond_tail(x, n_tail=n_tail, iters=iters, seed=seed)
+            # a fixed-capacity tail memorises small samples, so the deferred fit
+            # selects its tail on held-out cells
+            x, _, _, seed = self._density_args
+            self._density_args = None
+            self.fit_cond_tail_cv(
+                x,
+                seed=seed,
+                noise_sd=getattr(self, "_density_noise", None),
+                **getattr(self, "_tail_kw", {}),
+            )
 
         return self._cond
 
@@ -706,7 +1070,6 @@ class Flow(torch.nn.Module):
             weights, means, cov = m_step(resp)
             lb = -torch.inf
 
-            # E-step, stop on lower-bound convergence
             for _ in range(max_iter):
                 w_chol = prec_chol(cov)
                 y = (

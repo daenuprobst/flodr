@@ -11,8 +11,6 @@ from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
 from usearch.index import Index
 
-warnings.filterwarnings("ignore")
-
 
 def preprocess(
     X, n_components=50, seed=0, return_inverse=False, return_transform=False, whiten=1.0
@@ -37,8 +35,7 @@ def preprocess(
     return out[0] if len(out) == 1 else tuple(out)
 
 
-# the fitted map between inputs and the whitened coordinates the flow sees. an object rather
-# than closures, so a fitted model pickles
+# a class rather than closures, so a fitted model pickles
 class Whitening:
     def __init__(self, pca, n_head, head_mu, head_sd, tail_v, tail_sd):
         self.pca, self.n_head = pca, n_head
@@ -60,6 +57,25 @@ class Whitening:
         tail = ((Xn - self.pca.mean_) @ self.tail_v) / self.tail_sd
 
         return np.hstack([head, tail]).astype(np.float32)
+
+
+# R is orthogonal, so to_raw undoes the rotation and the inverse stays exact
+class RotatedWhitening:
+    def __init__(self, whitening, R):
+        self.whitening, self.R = whitening, np.asarray(R, dtype=np.float32)
+        self.n_head = self.R.shape[0]
+
+    def to_raw(self, Zn):
+        Zn = np.asarray(Zn, dtype=np.float32)
+        h = self.n_head
+
+        return self.whitening.to_raw(np.hstack([Zn[:, :h] @ self.R.T, Zn[:, h:]]))
+
+    def to_coords(self, Xn):
+        Z = self.whitening.to_coords(Xn)
+        h = self.n_head
+
+        return np.hstack([Z[:, :h] @ self.R, Z[:, h:]]).astype(np.float32)
 
 
 def raw_coords(X, n_components=50, seed=0):
@@ -114,12 +130,19 @@ def knn_query(Xref, Xq, k, metric="euclid"):
     self_q = Xq is None
 
     if metric == "jaccard":
-        nn = NearestNeighbors(n_neighbors=k + self_q, metric="jaccard").fit(
+        nn = NearestNeighbors(n_neighbors=k, metric="jaccard").fit(
             np.asarray(Xref, dtype=bool)
         )
+        # kneighbors(None) already leaves each point out of its own list
         dist, idx = nn.kneighbors(None if self_q else np.asarray(Xq, dtype=bool))
+
+        return np.asarray(dist, dtype=np.float64), np.asarray(idx, dtype=np.int64)
     else:
-        dist, idx = cKDTree(Xref).query(Xref if self_q else Xq, k=k + self_q)
+        # exact, so the thread count cannot change the answer; the fit's thread count,
+        # not every logical CPU
+        dist, idx = cKDTree(Xref).query(
+            Xref if self_q else Xq, k=k + self_q, workers=_threads()
+        )
 
     if self_q:
         dist, idx = dist[:, 1:], idx[:, 1:]
@@ -127,9 +150,127 @@ def knn_query(Xref, Xq, k, metric="euclid"):
     return np.asarray(dist, dtype=np.float64), np.asarray(idx, dtype=np.int64)
 
 
-def knn_search(Xp, k, exact=None):
+def _canonical(keys, dist2, k):
+    # (distance, index) order, then self pushed last and dropped
+    n = len(keys)
+    order = np.lexsort((keys, dist2), axis=1)
+    keys = np.take_along_axis(keys, order, axis=1)
+    dist2 = np.take_along_axis(dist2, order, axis=1)
+    order = np.argsort(keys == np.arange(n)[:, None], axis=1, kind="stable")
+    keys = np.take_along_axis(keys, order, axis=1)[:, :k]
+    dist2 = np.take_along_axis(dist2, order, axis=1)[:, :k]
+
+    return np.sqrt(dist2), keys
+
+
+def _gpu_blocks(X, Xc, sq, c, cells, rq):
+    import torch
+
+    n = len(X)
+    br = min(n, max(256, cells // 4096))
+    bq = min(n, max(1, cells // br))
+    keys = np.empty((n, c), np.int64)
+    dist2 = np.empty((n, c), np.float64)
+
+    for qs in range(0, n, bq):
+        q = Xc[qs : qs + bq]
+        best_d = best_i = None
+
+        for rs in range(0, n, br):
+            # |q|^2 is the same along a row, so it is left out of the ranking
+            blk = torch.addmm(sq[None, rs : rs + br], q, Xc[rs : rs + br].T, alpha=-2.0)
+            v, i = torch.topk(
+                blk, min(c, blk.shape[1]), dim=1, largest=False, sorted=False
+            )
+            i = i + rs
+
+            if best_d is not None:
+                v, i = torch.cat([best_d, v], 1), torch.cat([best_i, i], 1)
+                v, j = torch.topk(v, c, dim=1, largest=False, sorted=False)
+                i = torch.gather(i, 1, j)
+
+            best_d, best_i = v, i
+
+        for s in range(0, len(q), rq):
+            rows = slice(qs + s, qs + s + min(rq, len(q) - s))
+            cand = best_i[s : s + rq]
+            diff = X[rows][:, None, :].double() - X[cand].double()
+            keys[rows] = cand.cpu().numpy()
+            dist2[rows] = (diff**2).sum(-1).cpu().numpy()
+
+    return keys, dist2
+
+
+def knn_gpu(Xp, k, device="cuda", extra=16, cells=None):
+    # fp32 GEMM on centred data picks k + 1 + extra candidates, re-ranked in float64:
+    # exact unless fp32 rounding exceeds the gap from the k-th to the last candidate
+    import torch
+
+    dev = torch.device(device)
+    X = torch.as_tensor(np.ascontiguousarray(Xp, dtype=np.float32), device=dev)
+    n, n_dim = X.shape
+    c = min(n, k + 1 + extra)
+    Xc = X - X.mean(0, dtype=torch.float64).float()
+    sq = (Xc * Xc).sum(1)
+
+    # buffers take at most a quarter of free memory (24 bytes: the re-rank's three
+    # float64 arrays); out of memory, retry at a quarter of the size
+    for attempt in range(4):
+        free = torch.cuda.mem_get_info(dev)[0] if dev.type == "cuda" else 2**32
+        budget = max(2**24, free // 4) >> (2 * attempt)
+        block = cells or max(2**20, min(budget // 2, 2**30) // 4)
+        rq = max(1, min(2**28, budget // 2) // (24 * c * n_dim))
+
+        try:
+            with torch.no_grad():
+                tf32 = torch.backends.cuda.matmul.allow_tf32
+                torch.backends.cuda.matmul.allow_tf32 = False
+
+                try:
+                    keys, dist2 = _gpu_blocks(X, Xc, sq, c, block, rq)
+                finally:
+                    torch.backends.cuda.matmul.allow_tf32 = tf32
+
+            return _canonical(keys, dist2, k)
+        except torch.cuda.OutOfMemoryError:
+            if attempt == 3 or cells:
+                raise
+
+            torch.cuda.empty_cache()
+
+
+def _on_gpu(device):
+    import torch
+
+    if device is None:
+        return torch.cuda.is_available()
+
+    return str(device).startswith("cuda")
+
+
+def _threads():
+    from .train import default_threads
+
+    return default_threads()
+
+
+def knn_search(Xp, k, exact=None, device=None, info=None):
     X_f32 = np.ascontiguousarray(Xp, dtype=np.float32)
     n, n_dim = X_f32.shape
+    info = {} if info is None else info
+
+    if exact is not False and _on_gpu(device):
+        try:
+            out = knn_gpu(X_f32, k, "cuda" if device is None else device)
+            info["knn"] = "gpu_exact"
+            return out
+        except RuntimeError as err:
+            warnings.warn(
+                f"the GPU kNN failed ({str(err).splitlines()[0][:160]}); searching on the CPU, "
+                f"exact up to {EXACT_KNN_MAX} points and approximate (HNSW) above",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
     if exact is None:
         exact = n <= EXACT_KNN_MAX
@@ -146,20 +287,23 @@ def knn_search(Xp, k, exact=None):
             order = np.argsort(keys == np.arange(n)[:, None], axis=1, kind="stable")
             keys = np.take_along_axis(keys, order, axis=1)[:, :k]
             dist2 = np.take_along_axis(dist2, order, axis=1)[:, :k]
+            info["knn"] = "faiss_exact"
             return np.sqrt(np.clip(dist2, 0, None)), keys
         except ImportError:
             pass
 
     index = Index(ndim=n_dim, metric="l2sq", dtype="f32")
+    info["knn"] = "usearch_exact" if exact else "hnsw"
 
-    # HNSW is nondeterministic across threads, the exact path is not and may use all cores
-    index.add(np.arange(n), X_f32, threads=1 if not exact else 0)
-    res = index.search(X_f32, k + 1, threads=1 if not exact else 0, exact=exact)
+    # HNSW is nondeterministic across threads, so it runs on one
+    threads = _threads() if exact else 1
+    index.add(np.arange(n), X_f32, threads=threads)
+    res = index.search(X_f32, k + 1, threads=threads, exact=exact)
     keys, dist2 = res.keys.astype(np.int64), res.distances.astype(np.float64)
 
     if exact:
-        # canonical (distance, index) tie order, since multithreaded exact search returns ties
-        # in whatever order it finds them, which flips graph edges run-to-run
+        # multithreaded exact search returns ties in any order, which flips graph edges
+        # from run to run
         order = np.lexsort((keys, dist2), axis=1)
         keys = np.take_along_axis(keys, order, axis=1)
         dist2 = np.take_along_axis(dist2, order, axis=1)
@@ -172,7 +316,9 @@ def knn_search(Xp, k, exact=None):
     return np.sqrt(dist2), keys
 
 
-def fuzzy_knn_graph(Xp, k, n_iter=64, precomputed=None, return_dist=False):
+def fuzzy_knn_graph(
+    Xp, k, n_iter=64, precomputed=None, return_dist=False, device=None, info=None
+):
     n = len(Xp)
 
     if precomputed is not None:
@@ -183,7 +329,7 @@ def fuzzy_knn_graph(Xp, k, n_iter=64, precomputed=None, return_dist=False):
                 f"{dist.shape} and {idx.shape}"
             )
     else:
-        dist, idx = knn_search(Xp, k)
+        dist, idx = knn_search(Xp, k, device=device, info=info)
 
     rho = dist[:, 0]
     d_clip = np.clip(dist - rho[:, None], 0, None)
@@ -200,7 +346,6 @@ def fuzzy_knn_graph(Xp, k, n_iter=64, precomputed=None, return_dist=False):
     A = coo_matrix((w_attr.ravel(), (rows, idx.ravel())), shape=(n, n)).tocsr()
     B = (A + A.T - A.multiply(A.T)).tocoo()
 
-    # unique undirected edges
     mask = B.row < B.col
     out = (
         idx,
