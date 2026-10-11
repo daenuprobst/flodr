@@ -127,7 +127,8 @@ def test_density_noise_cap():
 
     X, _ = blobs(N, 40)
     X[:, 30:] = 1e-4 * np.random.default_rng(1).normal(size=(N, 10))
-    m = short().fit(X)
+    # the variance whitening's own formula; heat pushes the noise through its rotation (test_heat.py)
+    m = short(axes="variance").fit(X)
     wh = m._raw_of.__self__
     uncapped = m.density_sigma_ / np.concatenate([wh.head_sd, wh.tail_sd])
     sd_axis = np.asarray(m._coords, np.float64).std(0)
@@ -210,6 +211,7 @@ def test_params():
         "device",
         "verbose",
         "advanced",
+        "axes",
     }
     assert m.set_params(w=1.0).w == 1.0
     with pytest.raises(ValueError):
@@ -227,6 +229,7 @@ def test_params():
         dict(n_components=1),
         dict(max_iter=0),
         dict(w=-1),
+        dict(axes="pca"),
     ],
 )
 def test_rejects_bad_parameters(kw):

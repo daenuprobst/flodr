@@ -16,12 +16,14 @@ from sklearn.utils.validation import check_is_fitted, validate_data
 
 from . import fidelity
 from .data import (
+    RotatedWhitening,
     Whitening,
     find_ab,
     fuzzy_knn_graph,
     knn_query,
     raw_coords,
 )
+from .heat import heat_coordinates, heat_rotation
 from .train import TrainConfig, default_device, raw_recipe, train_flodr
 
 # in this size range the heaviest quarter of the fuzzy graph keeps more neighbours
@@ -94,12 +96,13 @@ def _has_density(est):
 
 
 class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
-    # fixed parts of the recipe, not user settings
+    # fixed parts of the recipe, not user settings; farthest-point landmarks cover rare branches
     _FROZEN = dict(
         n_neighbors=15,
         pca_head=50,
         stress_ordinal=True,
         density_noise_cap=0.5,
+        heat_landmarks="farthest",
     )
 
     def __init__(
@@ -113,6 +116,7 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
         device=None,
         verbose=True,
         advanced=None,
+        axes="variance",
     ):
         self.n_components = n_components
         self.w = w
@@ -122,6 +126,7 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
         self.device = device
         self.verbose = verbose
         self.advanced = advanced
+        self.axes = axes
 
     def __sklearn_tags__(self):
         tags = super().__sklearn_tags__()
@@ -170,6 +175,9 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
 
         if not (isinstance(self.w, numbers.Real) and self.w >= 0):
             raise ValueError(f"w must be a number >= 0, got {self.w!r}")
+
+        if self.axes not in ("variance", "heat"):
+            raise ValueError(f"axes must be 'variance' or 'heat', got {self.axes!r}")
 
         if max_iter is not None and not (
             isinstance(max_iter, numbers.Integral) and max_iter >= 1
@@ -268,6 +276,26 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
             info=info,
         )
         self.knn_backend_ = info["knn"]
+
+        # axes="heat" starts the flow from the heat geometry of the graph instead of the leading
+        # principal components; the layout keeps the arrangement it starts from. The rotation is
+        # orthogonal and undone on the way back, so the inverse stays exact
+        wh = getattr(self._raw_of, "__self__", None)
+
+        if self.axes == "heat" and isinstance(wh, Whitening):
+            P = heat_coordinates(
+                self.knn_dist_,
+                self.knn_idx_,
+                self.n_components,
+                self._device,
+                self._seed,
+                self._FROZEN["heat_landmarks"],
+                X,
+            )
+            R = heat_rotation(Z[:, : wh.n_head], P)
+            Z[:, : wh.n_head] = Z[:, : wh.n_head] @ R
+            rot = RotatedWhitening(wh, R)
+            self._raw_of, self._coords_of = rot.to_raw, rot.to_coords
 
         keep = prune_fraction(len(X))
 
