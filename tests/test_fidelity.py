@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 import torch
 
+import flodr.estimator
 from flodr import FloDR, fidelity
 from flodr.model import CondBase, Flow
 
@@ -225,6 +226,58 @@ def test_precision_reference_calibrated(base):
     cert = t.energy_certificate(cells(t, v, seed=6))
     assert 0.003 < cert["precision"]["wild"] < 0.02, cert["precision"]
     assert cert["precision"]["passed"]
+
+
+# the energy choice only on request, in smooth mode or by tail_select. The fit keeps the choice on
+# the flow, so the estimator's density fit and a deferred one through flow.cond make the same
+# call, in input units
+def test_tail_selection_wiring(base, monkeypatch):
+    assert base.flow_._tail_kw == dict(select="coverage")
+    X = np.random.default_rng(5).standard_normal((300, 20)).astype(np.float32)
+    on = FloDR(
+        device="cpu", max_iter=40, verbose=False, advanced=dict(threads=4, w_lin=1.0)
+    ).fit(X)
+    kw = on.flow_._tail_kw
+    assert kw["select"] == "energy" and kw["grid"] == flodr.estimator.ENERGY_GRID
+    A, b = kw["raw"]
+    Z = on._coords[:5]
+    np.testing.assert_allclose(Z @ A + b, on._to_raw(Z), atol=1e-4)
+    calls = []
+    monkeypatch.setattr(Flow, "fit_cond_tail_cv", lambda self, x, **k: calls.append(k))
+    m = copy.deepcopy(on)
+    m.flow_.cond
+    copy.deepcopy(on)._need_density()
+    assert len(calls) == 2 and calls[0].keys() == calls[1].keys()
+    for c in calls:
+        assert c["select"] == "energy" and c["grid"] == kw["grid"]
+        np.testing.assert_array_equal(c["raw"][0], A)
+    X = X[:100, :12]
+    for adv, select in (
+        (dict(w_lin=1.0, tail_select="coverage"), "coverage"),
+        (dict(tail_select="energy"), "energy"),
+    ):
+        m = FloDR(
+            device="cpu", max_iter=10, verbose=False, advanced=dict(threads=4, **adv)
+        )
+        assert m.fit(X).flow_._tail_kw["select"] == select
+    with pytest.raises(ValueError, match="tail_select"):
+        FloDR(device="cpu", max_iter=10, advanced=dict(tail_select="nll")).fit(X)
+
+
+# the estimator's density fit end to end in smooth mode, over one short candidate (the shipped
+# grid takes minutes on the CPU); one short tail need not pass
+@pytest.mark.filterwarnings("ignore:no density tail passed:RuntimeWarning")
+def test_energy_density_runs(monkeypatch):
+    monkeypatch.setattr(flodr.estimator, "ENERGY_GRID", ((2, 32, 100, 20),))
+    X = np.random.default_rng(6).standard_normal((300, 20)).astype(np.float32)
+    m = FloDR(
+        device="cpu", max_iter=40, verbose=False, advanced=dict(threads=4, w_lin=1.0)
+    ).fit(X[:250])
+    s = m.score_samples(X[250:])
+    ch = m.flow_.cond_choice_
+    assert np.isfinite(s).all() and ch["select"] == "energy" and ch["n_tail"] == 2
+    assert np.isfinite(ch["val_score"]) and 0 <= ch["val_wild"] <= 1
+    assert isinstance(ch["passed"], bool) and len(ch["candidates"]) == 1
 
 
 # the density's full-size passes go in chunks: within one chunk they are the single pass, and on a

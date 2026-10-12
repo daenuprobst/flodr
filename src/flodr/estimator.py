@@ -24,6 +24,7 @@ from .data import (
     raw_coords,
 )
 from .heat import heat_coordinates, heat_rotation
+from .model import ENERGY_GRID
 from .train import TrainConfig, default_device, raw_recipe, train_flodr
 
 # in this size range the heaviest quarter of the fuzzy graph keeps more neighbours
@@ -193,6 +194,13 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
         if bad:
             raise ValueError(f"advanced keys {bad} are not TrainConfig fields")
 
+        select = (self.advanced or {}).get("tail_select", "auto")
+
+        if select not in ("auto", "energy", "coverage"):
+            raise ValueError(
+                f"tail_select must be 'auto', 'energy' or 'coverage', got {select!r}"
+            )
+
     def _seed_from(self):
         rs = self.random_state
 
@@ -323,6 +331,9 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
             # at most half of each axis's own spread, so near-constant axes get no large noise
             sd = np.minimum(sd, self._FROZEN["density_noise_cap"] * _axis_sd(Z))
 
+        # the linearity term steps at that noise
+        lin = dict(noise_sd=sd) if sd is not None and self._cfg.w_lin else {}
+
         Y, roundtrip, _, flow = train_flodr(
             Z,
             edge_i,
@@ -333,6 +344,7 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
             w=w_attr,
             stress_X=X,
             progress=self.verbose,
+            **lin,
         )
 
         self.embedding_, self.roundtrip_, self.flow_ = (
@@ -373,7 +385,21 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
         return self
 
     def _tail_kw(self):
-        return dict(select="coverage")
+        cfg = self._cfg
+
+        # the energy-selected tail only with the linearity term
+        if cfg.tail_select == "coverage" or (
+            cfg.tail_select == "auto" and not cfg.w_lin
+        ):
+            return dict(select="coverage")
+
+        A, b = fidelity._raw_affine(self)
+
+        return dict(
+            select="energy",
+            grid=ENERGY_GRID,
+            raw=(A.astype(np.float32), b.astype(np.float32)),
+        )
 
     def fit_transform(self, X, y=None):
         return self.fit(X).embedding_
