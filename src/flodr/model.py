@@ -7,7 +7,6 @@ import warnings
 
 import numpy as np
 import torch
-from sklearn.cluster import KMeans
 from sklearn.mixture import GaussianMixture
 from threadpoolctl import threadpool_limits
 
@@ -385,12 +384,12 @@ class CondBase(torch.nn.Module):
 
     def r_params(self, y):
         out = self.net(y)
-        m = getattr(self, "m", out.shape[1] // 2)
+        m = self.m
 
         return out[:, :m], out[:, m : 2 * m].clamp(-8.0, 8.0)
 
     def scale_logw(self, y):
-        if not getattr(self, "n_scale", 0):
+        if not self.n_scale:
             return None
 
         return torch.log_softmax(self.net(y)[:, 2 * self.m :], 1)
@@ -511,9 +510,6 @@ class Flow(torch.nn.Module):
         self._density_noise = None
         self.base_logvar = torch.nn.Parameter(torch.zeros(d))
         self.d, self.hid, self.k = d, hid, k
-
-        for name in ("gmm_logw", "gmm_W", "gmm_muW", "gmm_logdet"):
-            self.register_buffer(name, None)
 
     @_chunked
     def forward(self, x):
@@ -999,119 +995,16 @@ class Flow(torch.nn.Module):
             self.fit_cond_tail_cv(
                 x,
                 seed=seed,
-                noise_sd=getattr(self, "_density_noise", None),
+                noise_sd=self._density_noise,
                 **getattr(self, "_tail_kw", {}),
             )
 
         return self._cond
 
-    def fit_density(self):
-        _ = self.cond
-
-        return self
-
-    def fit_gmm_base(
-        self, x, n_components=20, seed=0, max_iter=100, tol=1e-3, reg_covar=1e-4
-    ):
-        with torch.no_grad():
-            z32 = self.forward(
-                torch.as_tensor(x, dtype=torch.float32, device=self.base_logvar.device)
-            )
-
-        n_comp = max(1, min(n_components, z32.shape[0] // (2 * self.d)))
-
-        if not z32.is_cuda:
-            gmm = GaussianMixture(
-                n_comp,
-                covariance_type="full",
-                reg_covar=reg_covar,
-                max_iter=max_iter,
-                tol=tol,
-                random_state=seed,
-            ).fit(z32.double().cpu().numpy())
-
-            weights = torch.from_numpy(gmm.weights_)
-            means = torch.from_numpy(gmm.means_)
-            w_chol = torch.from_numpy(gmm.precisions_cholesky_)
-        else:
-            z = z32.double()
-            n, d = z.shape
-            eye = torch.eye(d, dtype=torch.float64, device=z.device)
-            labels = KMeans(n_comp, n_init=1, random_state=seed).fit_predict(
-                z.cpu().numpy()
-            )
-            resp = torch.zeros(n, n_comp, dtype=torch.float64, device=z.device)
-            resp[
-                torch.arange(n, device=z.device),
-                torch.as_tensor(labels, device=z.device),
-            ] = 1.0
-
-            def m_step(resp):
-                n_k = resp.sum(0) + 1e-12
-                means = (resp.T @ z) / n_k[:, None]
-                cov = torch.empty(n_comp, d, d, dtype=torch.float64, device=z.device)
-
-                for comp in range(n_comp):
-                    diff = z - means[comp]
-                    cov[comp] = (diff * resp[:, comp : comp + 1]).T @ diff / n_k[
-                        comp
-                    ] + reg_covar * eye
-
-                return n_k / n, means, cov
-
-            def prec_chol(cov):
-                chol = torch.linalg.cholesky(cov)
-
-                # precision = W W^T
-                return torch.linalg.solve_triangular(
-                    chol, eye.expand(n_comp, d, d).contiguous(), upper=False
-                ).transpose(1, 2)
-
-            weights, means, cov = m_step(resp)
-            lb = -torch.inf
-
-            for _ in range(max_iter):
-                w_chol = prec_chol(cov)
-                y = (
-                    torch.einsum("nd,kde->kne", z, w_chol)
-                    - torch.einsum("kd,kde->ke", means, w_chol)[:, None, :]
-                )
-                log_p = (
-                    -0.5 * ((y**2).sum(-1) + d * math.log(2 * math.pi))
-                    + torch.diagonal(w_chol, dim1=1, dim2=2).log().sum(1)[:, None]
-                    + weights.log()[:, None]
-                )
-                loglik = torch.logsumexp(log_p, 0)
-                lb_new = float(loglik.mean())
-
-                if abs(lb_new - lb) < tol:
-                    break
-
-                lb = lb_new
-                weights, means, cov = m_step((log_p - loglik).T.exp())
-
-            w_chol = prec_chol(cov)
-
-        dev = z32.device
-        self.gmm_logw = weights.float().log().to(dev)
-        self.gmm_W = w_chol.float().to(dev)
-        self.gmm_muW = torch.einsum("kd,kde->ke", means, w_chol).float().to(dev)
-        self.gmm_logdet = (
-            torch.diagonal(w_chol, dim1=1, dim2=2).log().sum(1).float().to(dev)
-        )
-
-        return self
-
     def base_log_prob(self, z):
         l2pi = math.log(2 * math.pi)
         if self.cond is not None:
             return self.cond.log_prob(z[:, : self.k], z[:, self.k :])
-
-        if self.gmm_logw is not None:
-            y = torch.einsum("nd,kde->kne", z, self.gmm_W) - self.gmm_muW[:, None, :]
-            log_p = -0.5 * ((y**2).sum(-1) + self.d * l2pi) + self.gmm_logdet[:, None]
-
-            return torch.logsumexp(self.gmm_logw[:, None] + log_p, 0)
 
         return -0.5 * (
             z**2 * torch.exp(-self.base_logvar) + self.base_logvar + l2pi

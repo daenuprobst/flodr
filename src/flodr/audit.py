@@ -19,6 +19,8 @@ TAUS = torch.exp(torch.linspace(-1.5, 1.5, 61, dtype=torch.float64))
 MAX_FIELD = 80_000
 MIN_CELLS = 20_000
 TEST_CELLS = 5_000
+# the null scores TEST_R replicas but fits TEST_REPS: all share one batched fit (its
+# initialisation and early stop), so fitting fewer would change the scored ones
 TEST_REPS = 199
 TEST_R = 99
 LEAF = 10
@@ -566,8 +568,8 @@ def _audit(data, basis, use_rep, key, X, labels, test, seed):
 
     if n < MIN_CELLS:
         msg = (
-            f"{n} labelled cells, below the 20,000 the bound was validated at; the level "
-            "can read up to ~10% high for labels simple in the input"
+            f"{n} labelled cells, fewer than 20,000: the level can read high for labels "
+            "that are simple in the input"
         )
         warnings.warn(msg, stacklevel=3)
         notes.append(msg)
@@ -627,7 +629,7 @@ def _audit(data, basis, use_rep, key, X, labels, test, seed):
         n_test = len(tsub)
 
         if m < TEST_CELLS:
-            msg = f"global test on all {m} cells, below the 5,000 it was validated at"
+            msg = f"global test on all {m} cells, fewer than 5,000: it has less power"
             warnings.warn(msg, stacklevel=3)
             notes.append(msg)
 

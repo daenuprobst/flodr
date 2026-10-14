@@ -94,29 +94,6 @@ def default_threads():
     return max(1, min(counts))
 
 
-class Lion(torch.optim.Optimizer):
-    def __init__(self, params, lr=1e-4, betas=(0.9, 0.99)):
-        super().__init__(params, dict(lr=lr, betas=betas))
-
-    @torch.no_grad()
-    def step(self):
-        for group in self.param_groups:
-            b1, b2 = group["betas"]
-
-            for param in group["params"]:
-                if param.grad is None:
-                    continue
-
-                mom = self.state.setdefault(param, {}).setdefault(
-                    "m", torch.zeros_like(param)
-                )
-                param.add_(
-                    torch.sign(mom.mul(b1).add(param.grad, alpha=1 - b1)),
-                    alpha=-group["lr"],
-                )
-                mom.mul_(b2 / b1 if b1 else b2).add_(param.grad, alpha=1 - b2)
-
-
 def _ns5(G):
     a, b, c = 3.4445, -4.7750, 2.0315
     X = G / (G.norm() + 1e-7)
@@ -191,7 +168,7 @@ class Muon(torch.optim.Optimizer):
                     param.addcdiv_(
                         _kept(ok, new),
                         _kept(ok, var_new.sqrt().add_(1e-8), 1.0),
-                        value=-group["lr"] * group["adam_ratio"] / 0.05 * 0.05,
+                        value=-group["lr"] * group["adam_ratio"],
                     )
 
     def _stacks(self):
@@ -252,7 +229,7 @@ class Muon(torch.optim.Optimizer):
             else:
                 V.mul_(torch.where(ok, 0.99, 1.0)).addcmul_(G, G, value=0.01)
                 U = M / (V.sqrt() + 1e-8)
-                rate = lr * (group["adam_ratio"] / 0.05 * 0.05)
+                rate = lr * group["adam_ratio"]
 
             torch._foreach_add_(params, list((U * (-rate * ok)).unbind(0)))
 
@@ -417,11 +394,11 @@ def _graphs_on(cfg, dev, flow, lin_on):
         or m._backward_pre_hooks
         for m in flow.modules()
     )
-    eager = lin_on or cfg.w_jac or cfg.checkpoint or cfg.optim != "muon" or hooked
+    eager = lin_on or cfg.checkpoint or cfg.optim != "muon" or hooked
 
     if eager and cfg.cudagraphs:
         warnings.warn(
-            "cudagraphs=True: the linearity or Jacobian term, checkpointing, an optimizer other "
+            "cudagraphs=True: the linearity term, checkpointing, an optimizer other "
             "than Muon or a hook on the flow keeps the step eager",
             RuntimeWarning,
             stacklevel=3,
@@ -499,15 +476,6 @@ class TrainConfig:
     # "euclid" | "jaccard" (needs stress_X in {0, 1})
     stress_metric: str = "euclid"
     w_nll: float = 0.5
-    # chart consistency on kNN edges, ||f^-1(y_j, r_i) - x_j||^2
-    w_chart: float = 0.0
-    # encoder-Jacobian validity, keep 0, it collapses recall
-    w_jac: float = 0.0
-    # "vec" | "lognorm" (size only) | "centered"
-    jac_mode: str = "vec"
-    jac_edges: int = 4096
-    # fraction of kNN edges permanently held out
-    jac_hold: float = 0.0
     # keep recon from reshaping the layout
     recon_detach: bool = True
     # ramp recon/nll/global in over this fraction of iters
@@ -528,14 +496,10 @@ class TrainConfig:
     # "energy": tail chosen by the energy certificate on held-out cells; "coverage": by
     # l-rank coverage, which keeps draws too wide; "auto": energy only with w_lin
     tail_select: str = "auto"
-    # GMM base components, only when cond_tail=0
-    gmm_base: int = 20
     # >0 restricts the sketch to the first N dims (the PCA head)
     sketch_head: int = 0
     # fixed k-dim sketch conditioner (0 = off)
     sketch: int = 0
-    # warm-start iters regressing dims 0-1 onto y_init
-    init_iters: int = 0
     device: str = field(default_factory=default_device)
     # the step as one CUDA graph: None = wherever supported, False = eager; not bitwise
     # equal to eager. FLODR_NO_GRAPHS=1 turns it off too
@@ -561,7 +525,7 @@ class TrainConfig:
     half_edges: str = ""
     # bf16 matmuls while training, fp32 everywhere else
     bf16: bool = False
-    # "adam" | "nadam" | "lion" (lr ~1e-4) | "muon" (lr ~0.02)
+    # "adam" | "nadam" | "muon" (lr ~0.02)
     optim: str = "adam"
     # "tanh" | "relu" | "silu"
     act: str = "tanh"
@@ -609,7 +573,6 @@ def raw_recipe(seed=0, threads=None, **overrides):
         aux_full_frac=0.05,
         w_nll=0.0,
         cond_tail=0,
-        gmm_base=0,
         # bf16 only reaches the full-batch step; the edge-batched one has half_edges
         bf16=False,
         optim="muon",
@@ -649,14 +612,13 @@ def train_flodr(
     return_model=False,
     w=None,
     stress_X=None,
-    y_init=None,
     progress=False,
     noise_sd=None,
 ):
     # cfg.threads and deterministic kernels are process-wide, so hold for this fit only
     if not cfg.threads:
         return _train_flodr(
-            Xp, ei, ej, cfg, rng, return_model, w, stress_X, y_init, progress, noise_sd
+            Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, noise_sd
         )
 
     prev = torch.get_num_threads()
@@ -673,7 +635,6 @@ def train_flodr(
                 return_model,
                 w,
                 stress_X,
-                y_init,
                 progress,
                 noise_sd,
             )
@@ -681,9 +642,7 @@ def train_flodr(
         torch.set_num_threads(prev)
 
 
-def _train_flodr(
-    Xp, ei, ej, cfg, rng, return_model, w, stress_X, y_init, progress, noise_sd
-):
+def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, noise_sd):
     n, D = Xp.shape
     k = cfg.k
 
@@ -738,22 +697,6 @@ def _train_flodr(
 
     flow = flow.to(dev)
 
-    if y_init is not None and cfg.init_iters:
-        y_init_t = torch.from_numpy(np.asarray(y_init)).float().to(dev)
-
-        opt_init = torch.optim.Adam(
-            flow.parameters(), lr=1e-3, fused=dev.type == "cuda"
-        )
-
-        gen_init = torch.Generator(device=dev).manual_seed(cfg.seed + 7)
-
-        for _ in range(cfg.init_iters):
-            rows = torch.randint(0, n, (min(2048, n),), device=dev, generator=gen_init)
-            loss_ws = ((flow(x_t[rows])[:, :k] - y_init_t[rows]) ** 2).mean()
-            opt_init.zero_grad(set_to_none=True)
-            loss_ws.backward()
-            opt_init.step()
-
     fine_params = [p for m in fine for p in m.high.parameters()]
     fine_ids = {id(p) for p in fine_params}
     params = [p for p in flow.parameters() if id(p) not in fine_ids]
@@ -761,7 +704,6 @@ def _train_flodr(
     opt = {
         "adam": lambda: torch.optim.Adam(params, lr=cfg.lr, fused=dev.type == "cuda"),
         "nadam": lambda: torch.optim.NAdam(params, lr=cfg.lr),
-        "lion": lambda: Lion(params, lr=cfg.lr),
         "muon": lambda: Muon(params, lr=cfg.lr),
     }[cfg.optim]()
     opt_fine = torch.optim.Adam(fine_params, lr=cfg.fine_lr) if fine else None
@@ -833,58 +775,18 @@ def _train_flodr(
 
     aux_n = n if cfg.aux_batch <= 0 else min(cfg.aux_batch, n)
 
-    jac_rows = None
-
-    if cfg.w_jac:
-        gen_hold = torch.Generator(device="cpu")
-        gen_hold.manual_seed(cfg.seed + 90210)
-        held = torch.rand(n_edges, generator=gen_hold) < cfg.jac_hold
-        jac_pool = torch.nonzero(~held).squeeze(1).to(dev)
-
-        if cfg.jac_mode == "centered":
-            ei_np = edge_i.detach().cpu().numpy().astype(np.int64)
-            keep_np = (~held).numpy()
-            order = np.argsort(ei_np, kind="stable")
-            order = order[keep_np[order]]
-            src = ei_np[order]
-            counts = np.bincount(src, minlength=n)
-            kmax = int(max(counts.max(), 2))
-            pad = np.zeros((n, kmax), np.int64)
-            mask = np.zeros((n, kmax), np.float32)
-            pos = np.arange(len(src)) - np.repeat(np.cumsum(counts) - counts, counts)
-            pad[src, pos] = order
-            mask[src, pos] = 1.0
-            jac_rows = (
-                torch.as_tensor(pad, device=dev),
-                torch.as_tensor(mask, device=dev),
-            )
-    else:
-        jac_pool = None
-
-    def _jac_terms(jac_sel):
-        pair_i, pair_j = edge_i[jac_sel].long(), edge_j[jac_sel].long()
-
-        x_i, x_j = x_t[pair_i], x_t[pair_j]
-        y_i, jv = torch.func.jvp(
-            lambda u: flow.forward_main(u)[:, :k], (x_i,), (x_j - x_i,)
-        )
-
-        return jv, y_i, pair_i, pair_j
-
     def step(
         neg_a,
         neg_b,
         glob_a,
         glob_b,
         rows,
-        chart_e,
         keep,
         ramp,
         str_a,
         str_b,
         str_c,
         str_d,
-        jac_sel,
     ):
         Z, logdet = flow.forward_with_logdet(x_t)
         Y = Z[:, :k]
@@ -932,8 +834,7 @@ def _train_flodr(
         else:
             L_stress = 0.0
 
-        rows_ = rows
-        z_sub, logdet_s = Z[rows_], logdet[rows_]
+        z_sub, logdet_s = Z[rows], logdet[rows]
 
         if cfg.w_recon:
             y_head = z_sub[:, :k].detach() if cfg.recon_detach else z_sub[:, :k]
@@ -949,69 +850,17 @@ def _train_flodr(
             else:
                 x_rec = flow.inverse(z_trunc)
 
-            L_recon = ((x_rec - x_t[rows_]) ** 2).mean()
+            L_recon = ((x_rec - x_t[rows]) ** 2).mean()
         else:
             L_recon = 0.0
 
         L_nll = -(flow.base_log_prob(z_sub) + logdet_s).mean() / D if cfg.w_nll else 0.0
 
-        if cfg.w_chart:
-            src_i, dst_j = edge_i[chart_e], edge_j[chart_e]
-            z_mix = torch.cat([Z[dst_j, :k], Z[src_i, k:]], 1)
-            L_chart = ((flow.inverse(z_mix) - x_t[dst_j]) ** 2).mean()
-        else:
-            L_chart = 0.0
-
-        if cfg.w_jac:
-            with torch.autocast(dev.type, enabled=False):
-                if cfg.jac_mode == "centered":
-                    pad_rows, mask_rows = jac_rows
-                    pad_sel, mask_sel = (
-                        pad_rows[jac_sel],
-                        mask_rows[jac_sel],
-                    )
-                    jv, y_i, pair_i, pair_j = _jac_terms(pad_sel.reshape(-1))
-                    dy = Z[pair_j, :k] - y_i
-                    resid = (
-                        0.5 * torch.log((jv**2).sum(1).clamp_min(1e-12))
-                        - 0.5 * torch.log((dy**2).sum(1).clamp_min(1e-12))
-                    ).reshape(pad_sel.shape)
-                    counts = mask_sel.sum(1, keepdim=True).clamp_min(1.0)
-                    res_mean = (resid * mask_sel).sum(1, keepdim=True) / counts
-                    L_jac = (
-                        (resid - res_mean) ** 2 * mask_sel
-                    ).sum() / mask_sel.sum().clamp_min(1.0)
-                    return L_local + ramp * (
-                        cfg.w_recon * L_recon
-                        + cfg.w_global * L_glob
-                        + cfg.w_nll * L_nll
-                        + cfg.w_chart * L_chart
-                        + cfg.w_stress * L_stress
-                        + cfg.w_jac * L_jac
-                    )
-                jv, y_i, pair_i, pair_j = _jac_terms(jac_sel)
-                dy = Z[pair_j, :k] - y_i
-
-                if cfg.jac_mode == "lognorm":
-                    L_jac = (
-                        0.5 * torch.log((jv**2).sum(1).clamp_min(1e-12))
-                        - 0.5 * torch.log((dy**2).sum(1).clamp_min(1e-12))
-                    ) ** 2
-                    L_jac = L_jac.mean()
-                # "vec" is the relative vector error
-                else:
-                    L_jac = (
-                        ((jv - dy) ** 2).sum(1) / (dy**2).sum(1).clamp_min(1e-12)
-                    ).mean()
-        else:
-            L_jac = 0.0
         return L_local + ramp * (
             cfg.w_recon * L_recon
             + cfg.w_global * L_glob
             + cfg.w_nll * L_nll
-            + cfg.w_chart * L_chart
             + cfg.w_stress * L_stress
-            + cfg.w_jac * L_jac
         )
 
     # a step's draws, outside the loss, so a compiled loss sees the eager indices
@@ -1044,13 +893,11 @@ def _train_flodr(
                 mdist_b = _lh(row_c, row_d)
 
         rows = draw(n_uniq, min(aux_n, n_uniq))
-        chart_e = draw(n_edge, min(aux_n, n_edge)) if cfg.w_chart else None
         wa = w_attr[edge_idx] if w_attr is not None else None
 
         return (
             x_t[uniq],
             inv,
-            pts,
             wa,
             neg_a,
             neg_b,
@@ -1065,13 +912,11 @@ def _train_flodr(
             mdist_a,
             mdist_b,
             rows,
-            chart_e,
         )
 
     def loss_edge_batch(
         x_uniq,
         inv,
-        pts,
         wa,
         neg_a,
         neg_b,
@@ -1086,7 +931,6 @@ def _train_flodr(
         mdist_a,
         mdist_b,
         rows,
-        chart_e,
         keep,
         ramp,
     ):
@@ -1154,14 +998,6 @@ def _train_flodr(
 
         L_nll = -(flow.base_log_prob(z_sub) + logdet_s).mean() / D if cfg.w_nll else 0.0
 
-        if cfg.w_chart:
-            z_mix = torch.cat(
-                [Z[inv[n_edge:][chart_e], :k], Z[inv[:n_edge][chart_e], k:]], 1
-            )
-            L_chart = ((flow.inverse(z_mix) - x_t[pts[n_edge:][chart_e]]) ** 2).mean()
-        else:
-            L_chart = 0.0
-
         return (
             L_attr
             + cfg.w_rep * L_rep
@@ -1170,14 +1006,11 @@ def _train_flodr(
                 cfg.w_recon * L_recon
                 + cfg.w_global * L_glob
                 + cfg.w_nll * L_nll
-                + cfg.w_chart * L_chart
                 + cfg.w_stress * L_stress
             )
         )
 
-    compiled_edges = (
-        cfg.compile_edges and dev.type == "cuda" and not (cfg.w_recon or cfg.w_chart)
-    )
+    compiled_edges = cfg.compile_edges and dev.type == "cuda" and not cfg.w_recon
     loss_edge_eager = loss_edge_batch
 
     if compiled_edges:
@@ -1276,7 +1109,6 @@ def _train_flodr(
                     if cfg.w_stress
                     else None
                 ),
-                chart_e=uniform(min(aux_n, eb_size)) if cfg.w_chart else None,
             )
             edge_idx_t = torch.zeros(eb_size, dtype=torch.int64, device=dev)
 
@@ -1288,7 +1120,7 @@ def _train_flodr(
                         torch.rand(val.shape, generator=gen, out=val)
 
             def loss_edges_fixed(
-                edge_idx, neg_a, neg_b, glob_a, glob_b, rows, pairs, chart_e, keep, ramp
+                edge_idx, neg_a, neg_b, glob_a, glob_b, rows, pairs, keep, ramp
             ):
                 pts = torch.cat([edge_i[edge_idx], edge_j[edge_idx]])
                 uniq, inv, n_uniq = _padded_unique(pts, u_cap)
@@ -1314,7 +1146,6 @@ def _train_flodr(
                 loss = loss_edge_batch(
                     x_t[uniq],
                     inv,
-                    pts,
                     w_attr[edge_idx] if w_attr is not None else None,
                     pick(neg_a),
                     pick(neg_b),
@@ -1326,11 +1157,6 @@ def _train_flodr(
                     mdist_a,
                     mdist_b,
                     pick(rows),
-                    (
-                        (chart_e * eb_size).long().clamp_max(eb_size - 1)
-                        if chart_e is not None
-                        else None
-                    ),
                     keep,
                     ramp,
                 )
@@ -1349,8 +1175,8 @@ def _train_flodr(
 
         else:
 
-            def index(size, dtype=torch.int32):
-                return torch.zeros(size, dtype=dtype, device=dev)
+            def index(size):
+                return torch.zeros(size, dtype=torch.int32, device=dev)
 
             # in the order the eager step draws them, so both see the same indices
             buf.update(
@@ -1360,9 +1186,6 @@ def _train_flodr(
                 glob_b=index(3 * n),
                 rows=index(aux_n),
             )
-
-            if cfg.w_chart:
-                buf["chart_e"] = index(min(aux_n, n_edges), torch.int64)
 
             if cfg.w_stress:
                 buf.update(str_a=index(4 * n), str_b=index(4 * n))
@@ -1378,8 +1201,7 @@ def _train_flodr(
                     if key == "rows" and late:
                         continue
 
-                    high = n_edges if key == "chart_e" else n
-                    torch.randint(0, high, val.shape, generator=gen, out=val)
+                    torch.randint(0, n, val.shape, generator=gen, out=val)
 
             step_fixed = (
                 torch.compile(step, dynamic=False, fullgraph=True)
@@ -1402,11 +1224,9 @@ def _train_flodr(
                         buf["glob_a"],
                         buf["glob_b"],
                         rows_all if late else buf["rows"],
-                        buf.get("chart_e", spare),
                         keep_t,
                         ramp_t,
                         *pairs,
-                        spare,
                     ),
                     None,
                 )
@@ -1521,43 +1341,16 @@ def _train_flodr(
             else:
                 rows = _ri(aux_n)
 
-            # drawn only when used, so w_chart=0 leaves the RNG stream untouched
-            chart_e = (
-                torch.randint(
-                    0, n_edges, (min(aux_n, n_edges),), device=dev, generator=gen
-                )
-                if cfg.w_chart
-                else neg_a[:1]
-            )
-
-            # likewise
+            # drawn only when used, so w_stress=0 leaves the RNG stream untouched
             if cfg.w_stress:
                 str_a, str_b = _ri(4 * n), _ri(4 * n)
                 str_c, str_d = (
                     (_ri(4 * n), _ri(4 * n))
-                    if (cfg.w_stress and cfg.stress_ordinal)
+                    if cfg.stress_ordinal
                     else (str_a[:1], str_a[:1])
                 )
             else:
                 str_a = str_b = str_c = str_d = neg_a[:1]
-
-            if cfg.w_jac and cfg.jac_mode == "centered":
-                # here jac_edges is a point budget, edges ~ jac_edges * mean degree
-                jac_sel = torch.randint(
-                    0, n, (max(1, cfg.jac_edges // 12),), device=dev, generator=gen
-                )
-            elif cfg.w_jac:
-                jac_sel = jac_pool[
-                    torch.randint(
-                        0,
-                        jac_pool.shape[0],
-                        (min(cfg.jac_edges, jac_pool.shape[0]),),
-                        device=dev,
-                        generator=gen,
-                    )
-                ]
-            else:
-                jac_sel = neg_a[:1]
 
             with torch.autocast(dev.type, dtype=torch.bfloat16, enabled=cfg.bf16):
                 loss = step(
@@ -1566,14 +1359,12 @@ def _train_flodr(
                     glob_a,
                     glob_b,
                     rows,
-                    chart_e,
                     keep,
                     ramps[it] if compiled else ramp,
                     str_a,
                     str_b,
                     str_c,
                     str_d,
-                    jac_sel,
                 )
 
         # outside autocast, in fp32
@@ -1621,10 +1412,8 @@ def _train_flodr(
         main_step.__self__.settle()
 
     if cfg.cond_tail:
-        # deferred to the first density use, or to an explicit fit_density()
+        # deferred to the first density use
         flow._density_args = (x_t, cfg.cond_tail, cfg.cond_iters, cfg.seed)
-    elif cfg.gmm_base:
-        flow.fit_gmm_base(x_t, cfg.gmm_base, seed=cfg.seed)
 
     with torch.no_grad():
         Z = flow(x_t)

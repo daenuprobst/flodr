@@ -23,7 +23,7 @@ def fibre_score(est, X, chunk=8192, noised=False):
     est._need_density()
     z_all = np.ascontiguousarray(est._to_coords(np.asarray(X, np.float32)), np.float32)
 
-    if noised and hasattr(est, "_noised"):
+    if noised:
         z_all = np.ascontiguousarray(est._noised(z_all), np.float32)
     flow, dev = est.flow_, _dev(est)
     l_out = np.empty(len(z_all))
@@ -39,15 +39,7 @@ def fibre_score(est, X, chunk=8192, noised=False):
 
 
 def _sample_r(cond, y, gen):
-    # the base knows its own law, which may be a scale mixture
-    if hasattr(cond, "sample_r"):
-        return cond.sample_r(y, gen)
-
-    mu, logvar = cond.r_params(y)
-
-    return mu + torch.exp(0.5 * logvar) * torch.randn(
-        mu.shape, device=y.device, generator=gen
-    )
+    return cond.sample_r(y, gen)
 
 
 def _fibre_chunks(est, Y, n_draws, seed, width):

@@ -4,8 +4,6 @@ import numpy as np
 from scipy.linalg import null_space
 from scipy.optimize import curve_fit
 from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import laplacian
-from scipy.sparse.linalg import eigsh
 from scipy.spatial import cKDTree
 from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
@@ -98,29 +96,6 @@ def raw_coords(X, n_components=50, seed=0):
     wh = Whitening(pca, n_head, head_mu, head_sd, tail_v, tail_sd)
 
     return Z, wh.to_raw, wh.to_coords
-
-
-def spectral_init(ei, ej, w, n, scale=1.0, seed=0):
-    graph = coo_matrix(
-        (np.asarray(w, dtype=np.float64), (ei, ej)), shape=(n, n)
-    ).tocsr()
-    graph = graph.maximum(graph.T)
-
-    lap = laplacian(graph, normed=True)
-
-    try:
-        k = 3
-        _, vecs = eigsh(
-            lap, k=k, sigma=-1e-3, which="LM", v0=np.ones(n) / np.sqrt(n), maxiter=n * 5
-        )
-        layout = vecs[:, 1:3]
-    except Exception:
-        layout = np.random.default_rng(seed).standard_normal((n, 2))
-
-    layout = np.asarray(layout, dtype=np.float32)
-    layout = layout - layout.mean(0)
-
-    return (layout / (layout.std(0) + 1e-12) * scale).astype(np.float32)
 
 
 EXACT_KNN_MAX = 50_000
