@@ -1,8 +1,8 @@
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
 from matplotlib.colors import to_rgb
-from scipy.spatial import cKDTree
+
+from .audit import plot_audit
 
 RC = {
     "font.size": 11,
@@ -15,480 +15,229 @@ RC = {
     "savefig.facecolor": "white",
 }
 
-# NeurIPS-sized, 5.5in text width, serif
-RC_PAPER = {
-    "font.size": 8,
-    "axes.titlesize": 8,
-    "legend.fontsize": 7,
-    "xtick.labelsize": 7,
-    "ytick.labelsize": 7,
-    "font.family": "serif",
-    "mathtext.fontset": "stix",
-    "font.serif": ["Times New Roman", "STIXGeneral", "DejaVu Serif"],
-    "pdf.fonttype": 42,
-    "ps.fonttype": 42,
-    "savefig.facecolor": "white",
-    "axes.linewidth": 0.6,
-}
+__all__ = [
+    "RC",
+    "frame",
+    "plot_embedding",
+    "plot_frontier",
+    "plot_ranks",
+    "plot_paths",
+    "plot_band",
+    "plot_audit",
+    "save",
+]
 
 
-def residual(flow, X):
-    device = next(flow.parameters()).device
-
-    with torch.no_grad():
-        return (
-            flow.forward_main(torch.as_tensor(X, dtype=torch.float32, device=device))[
-                :, flow.k :
-            ]
-            .cpu()
-            .numpy()
-        )
-
-
-def residual_fraction(flow, X):
-    device = next(flow.parameters()).device
-    with torch.no_grad():
-        z = flow.forward_main(torch.as_tensor(X, dtype=torch.float32, device=device))
-
-        return float(
-            (z[:, flow.k :].norm(dim=1) / z.norm(dim=1).clamp(min=1e-12)).median()
-        )
-
-
-def occupancy_field(Y, n_grid=100, scale=5.0, pad=0.06):
-    Y = np.asarray(Y, float)
-    lo, hi = Y.min(0) - pad * np.ptp(Y, 0), Y.max(0) + pad * np.ptp(Y, 0)
-    xs, ys = np.linspace(lo[0], hi[0], n_grid), np.linspace(lo[1], hi[1], n_grid)
-    grid_x, grid_y = np.meshgrid(xs, ys)
-    tree = cKDTree(Y)
-    med_nn = float(np.median(tree.query(Y, k=2)[0][:, 1]))
-    dist = tree.query(np.column_stack([grid_x.ravel(), grid_y.ravel()]), k=1)[
-        0
-    ].reshape(n_grid, n_grid)
-    return xs, ys, np.clip(1.0 - (dist / (scale * med_nn + 1e-12)) ** 2, 0.0, 1.0)
-
-
-def _sample_fiber(flow, yb, n_samples, gen, to_input):
-    cond = flow.cond
-    mu, logvar = cond.r_params(yb)
-    sigma = torch.exp(0.5 * logvar)
-    out = []
-
-    for _ in range(n_samples):
-        r = mu + sigma * torch.randn(mu.shape, device=yb.device, generator=gen)
-        x = flow.inverse(torch.cat([yb, r], 1)).cpu().numpy()
-        out.append(np.asarray(to_input(x) if to_input is not None else x, np.float64))
-
-    return np.stack(out)
-
-
-def conditional_spread(flow, Y, to_input=None, n_samples=64, seed=0, chunk=1024):
-    return conditional_moments(
-        flow, Y, to_input=to_input, n_samples=n_samples, seed=seed, chunk=chunk
-    )[1]
-
-
-def conditional_moments(flow, Y, to_input=None, n_samples=64, seed=0, chunk=1024):
-    if flow.cond is None:
-        raise ValueError(
-            "no conditional base: fit with density enabled (cond_tail > 0) first"
-        )
-
-    device = next(flow.parameters()).device
-    y_torch = torch.as_tensor(np.asarray(Y, np.float32), device=device)
-    gen = torch.Generator(device=device)
-    gen.manual_seed(seed)
-    sigma = np.empty(y_torch.shape[0])
-    means = []
-
-    with torch.no_grad():
-        for start in range(0, y_torch.shape[0], chunk):
-            samples = _sample_fiber(
-                flow, y_torch[start : start + chunk], n_samples, gen, to_input
-            )
-            mu = samples.mean(0)
-            sigma[start : start + chunk] = np.sqrt(((samples - mu) ** 2).sum(2).mean(0))
-            means.append(mu)
-
-    return np.concatenate(means), sigma
-
-
-def conditional_atypicality(flow, Z, to_input=None, n_samples=128, seed=0, chunk=512):
-    if flow.cond is None:
-        raise ValueError(
-            "no conditional base: fit with density enabled (cond_tail > 0) first"
-        )
-
-    device = next(flow.parameters()).device
-    z_torch = torch.as_tensor(np.asarray(Z, np.float32), device=device)
-    gen = torch.Generator(device=device)
-    gen.manual_seed(seed)
-
-    x = np.asarray(
-        to_input(np.asarray(Z, np.float32)) if to_input is not None else Z, np.float64
-    )
-
-    out = np.empty(z_torch.shape[0])
-
-    with torch.no_grad():
-        y_all = flow(z_torch)[:, : flow.k]
-
-        for start in range(0, z_torch.shape[0], chunk):
-            samples = _sample_fiber(
-                flow, y_all[start : start + chunk], n_samples, gen, to_input
-            )
-            mu = samples.mean(0)
-            # (n_samples, m)
-            d_samp = np.sqrt(((samples - mu) ** 2).sum(2))
-            # (m,)
-            d_x = np.sqrt(((x[start : start + chunk] - mu) ** 2).sum(1))
-            out[start : start + chunk] = (d_samp < d_x).mean(0)
-
-    return out
-
-
-def plot_field(Y, v, ax=None, cmap="Reds", s=8):
-    Y = np.asarray(Y, float)
-    ax = ax or plt.gca()
-    sc = ax.scatter(
-        Y[:, 0], Y[:, 1], c=np.asarray(v, float), cmap=cmap, s=s, linewidths=0
-    )
-    ax.figure.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.set_aspect("equal")
+def frame(ax, Y, crop=(1, 99), pad=0.03):
+    # a square box at 1:1 data scale around the given percentiles, so a few far points
+    # do not shrink the map
+    lo, hi = np.percentile(np.asarray(Y, float)[:, :2], crop, axis=0)
+    rad, (cx, cy) = (hi - lo).max() * (0.5 + pad), (lo + hi) / 2
+    ax.set_box_aspect(1)
+    ax.set_aspect("equal", adjustable="datalim")
+    ax.set(xlim=(cx - rad, cx + rad), ylim=(cy - rad, cy + rad), xticks=[], yticks=[])
 
     for spine in ax.spines.values():
-        spine.set_color("0.8")
+        spine.set(linewidth=0.6, color="0.6")
 
     return ax
 
 
-def plot_embedding(Y, labels=None, ax=None, cmap="tab10", s=6, title=None):
-    Y = np.asarray(Y, float)
-    ax = ax or plt.gca()
+def palette(labels):
+    uniq = np.unique(np.asarray(labels).astype(str))
+    cycle = plt.get_cmap("tab10" if len(uniq) <= 10 else "tab20").colors
 
-    if labels is None:
-        ax.scatter(Y[:, 0], Y[:, 1], s=s, c="0.3", alpha=0.6, linewidths=0)
-    else:
-        pal = plt.get_cmap(cmap)
-        ax.scatter(
-            Y[:, 0],
-            Y[:, 1],
-            s=s,
-            alpha=0.7,
-            linewidths=0,
-            c=[pal(int(v) % 10) for v in np.asarray(labels)],
-        )
-
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.set_aspect("equal")
-
-    for spine in ax.spines.values():
-        spine.set_color("0.8")
-
-    if title:
-        ax.set_title(title)
-
-    return ax
+    return {c: cycle[i % len(cycle)] for i, c in enumerate(uniq)}
 
 
-BIVARIATE_SCHEMES = {
-    # corners are [low-low, high-x, high-y, high-both]
-    # CVD-validated
-    "accessible": ["#e7e7e3", "#2a78d6", "#e34948", "#4a3aa7"],
-    "Bluegill": ["#d3d3d3", "#74a7a3", "#976020", "#534c19"],
-    "BlueGold": ["#d3d3d3", "#488fb0", "#dea301", "#4c6e01"],
-    "BlueOr": ["#d3d3d3", "#dd6a29", "#169dd0", "#174f28"],
-    "BlueYl": ["#d3d3d3", "#d9be00", "#0088d9", "#007b00"],
-    "Brown2": ["#d3d3d3", "#b6a352", "#8b689f", "#78503e"],
-    "DkBlue2": ["#d3d3d3", "#52b6b6", "#ad5b9c", "#434e87"],
-    "DkCyan2": ["#d3d3d3", "#6277a5", "#699e74", "#31595b"],
-    "DkViolet2": ["#d3d3d3", "#9e3547", "#4279b0", "#311e3b"],
-    "GrPink2": ["#d3d3d3", "#b65252", "#5b9cad", "#4e3d43"],
-    "PinkGrn": ["#d3d3d3", "#459b22", "#bc177d", "#3e1114"],
-    "PurpleGrn": ["#d3d3d3", "#027a2e", "#6f2d85", "#011a1d"],
-    "PurpleOr": ["#d3d3d3", "#d25601", "#563787", "#551601"],
-}
-
-
-def _scheme_cols(scheme):
-    hexes = BIVARIATE_SCHEMES.get(scheme, scheme) if isinstance(scheme, str) else scheme
-    return np.array([to_rgb(h) for h in hexes], float)
-
-
-def _quantize(v, steps):
-    if steps <= 1:
-        return np.zeros_like(v)
-
-    edges = np.quantile(v, np.linspace(0, 1, steps + 1))[1:-1]
-
-    return np.clip(np.digitize(v, edges), 0, steps - 1) / (steps - 1)
-
-
-def _norm01(v, log=False, floor0=False, lo=2, hi=98):
-    v = np.asarray(v, float)
-
-    if floor0:
-        v = np.clip(v, 0.0, None)
-
-    p_lo, p_hi = np.percentile(v, lo), np.percentile(v, hi)
-
-    if log:
-        p_lo = max(p_lo, 1e-9)
-        return np.clip(
-            (np.log(np.clip(v, p_lo, p_hi)) - np.log(p_lo))
-            / (np.log(p_hi) - np.log(p_lo) + 1e-12),
-            0,
-            1,
-        )
-
-    return np.clip((v - p_lo) / (p_hi - p_lo + 1e-12), 0.0, 1.0)
-
-
-def _bare(ax):
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.set_aspect("equal")
-
-    for spine in ax.spines.values():
-        spine.set_color("0.8")
-
-
-def _bare3d(ax):
-    ax.set_axis_off()
-
-
-def depth_fog(Y, elev=22.0, azim=-60.0, strength=0.9, gamma=2.4):
-    Y = np.asarray(Y, float)
-    elev_r, azim_r = np.radians(elev), np.radians(azim)
-    view = np.array(
-        [
-            np.cos(elev_r) * np.cos(azim_r),
-            np.cos(elev_r) * np.sin(azim_r),
-            np.sin(elev_r),
-        ]
-    )
-    # signed distance along the line of sight
-    depth = (Y - Y.mean(0)) @ view
-    # 1 near camera, 0 far
-    near = (depth - depth.min()) / (np.ptp(depth) + 1e-12)
-    weight = (1.0 - strength * (1.0 - near) ** gamma)[:, None]
-
-    return np.argsort(depth), weight, near
-
-
-def _emptiest_corner(Y, ax, box=0.30):
-    Y = np.asarray(Y, float)
-    (x0, x1), (y0, y1) = ax.get_xlim(), ax.get_ylim()
-    frac_x = (Y[:, 0] - x0) / (x1 - x0 + 1e-12)
-    frac_y = (Y[:, 1] - y0) / (y1 - y0 + 1e-12)
-    anchors = [(0.0, 1 - box), (1 - box, 1 - box), (0.0, 0.0), (1 - box, 0.0)]
-    counts = [
-        int(
-            (
-                (frac_x >= cx)
-                & (frac_x < cx + box)
-                & (frac_y >= cy)
-                & (frac_y < cy + box)
-            ).sum()
-        )
-        for cx, cy in anchors
-    ]
-
-    return int(np.argmin(counts))
-
-
-def _corner_xy(i, w, h=None, pad=0.02):
-    h = w if h is None else h
-
-    return [
-        (pad, 1 - h - pad),
-        (1 - w - pad, 1 - h - pad),
-        (pad, pad),
-        (1 - w - pad, pad),
-    ][i]
-
-
-def _bivar_mix(sx, sy, cols):
-    sx = np.clip(np.asarray(sx, float), 0, 1)
-    sy = np.clip(np.asarray(sy, float), 0, 1)
-
-    if len(cols) == 4:
-        c00, c10, c01, c11 = cols
-
-        return np.clip(
-            (1 - sx)[:, None] * (1 - sy)[:, None] * c00
-            + sx[:, None] * (1 - sy)[:, None] * c10
-            + (1 - sx)[:, None] * sy[:, None] * c01
-            + sx[:, None] * sy[:, None] * c11,
-            0,
-            1,
-        )
-
-    # [y, x, rgb]
-    grid = cols.reshape(3, 3, 3)
-
-    gx, gy = sx * 2, sy * 2
-
-    xi = np.clip(np.floor(gx).astype(int), 0, 1)
-    yi = np.clip(np.floor(gy).astype(int), 0, 1)
-    tx, ty = (gx - xi)[:, None], (gy - yi)[:, None]
-
-    return np.clip(
-        (1 - tx) * (1 - ty) * grid[yi, xi]
-        + tx * (1 - ty) * grid[yi, xi + 1]
-        + (1 - tx) * ty * grid[yi + 1, xi]
-        + tx * ty * grid[yi + 1, xi + 1],
-        0,
-        1,
-    )
-
-
-def _bivar_key(ax, mode, cols, steps, ci, xlabel, ylabel):
-    ramp = (
-        np.arange(steps) / (steps - 1) if steps and steps > 1 else np.linspace(0, 1, 40)
-    )
-
-    zero = np.zeros_like(ramp)
-
-    if mode == "both":
-        x0, y0 = _corner_xy(ci, 0.22, pad=0.055)
-
-        inset = ax.inset_axes([x0, y0, 0.22, 0.22])
-        inset.set_box_aspect(1)
-
-        gx, gy = np.meshgrid(ramp, ramp)
-        img = _bivar_mix(gx.ravel(), gy.ravel(), cols).reshape(len(ramp), len(ramp), 3)
-
-        inset.set_xlabel(xlabel, fontsize=8, labelpad=1)
-        inset.set_ylabel(ylabel, fontsize=8, labelpad=1)
-    elif mode == "x":
-        x0, y0 = _corner_xy(ci, 0.24, 0.05, pad=0.055)
-
-        inset = ax.inset_axes([x0, y0, 0.24, 0.05])
-        img = _bivar_mix(ramp, zero, cols).reshape(1, len(ramp), 3)
-        inset.set_xlabel(xlabel, fontsize=8, labelpad=1)
-    else:
-        x0, y0 = _corner_xy(ci, 0.05, 0.24, pad=0.055)
-        inset = ax.inset_axes([x0, y0, 0.05, 0.24])
-        img = _bivar_mix(zero, ramp, cols).reshape(len(ramp), 1, 3)
-        inset.set_ylabel(ylabel, fontsize=8, labelpad=1)
-
-    inset.imshow(
-        img, origin="lower", extent=[0, 1, 0, 1], aspect="auto", interpolation="nearest"
-    )
-
-    inset.set_xticks([])
-    inset.set_yticks([])
-
-    for spine in inset.spines.values():
-        spine.set_color("0.55")
-        spine.set_linewidth(0.6)
-
-    return inset
-
-
-def bivariate_field(
+def plot_embedding(
     Y,
-    x,
-    y,
+    labels=None,
+    values=None,
     ax=None,
-    scheme="accessible",
-    steps=None,
-    x_pass=True,
-    y_pass=True,
-    highlight=None,
-    threed=False,
-    fog=True,
-    elev=22.0,
-    azim=-60.0,
-    fog_strength=0.9,
-    shade=None,
-    x_log=True,
-    y_sqrt=True,
-    s=6,
-    legend=True,
-    xlabel=r"$\sigma \rightarrow$",
-    ylabel=r"$h \rightarrow$",
+    colours=None,
+    cmap="viridis",
+    norm=None,
+    s=None,
+    order="random",
+    crop=(1, 99),
+    text=None,
 ):
+    # a map coloured by labels (colours maps label to colour) or by values (on cmap);
+    # order "random" shuffles the points so no class hides another, "high" and "low"
+    # draw the high or low values last
     Y = np.asarray(Y, float)
-    cols = _scheme_cols(scheme)
-    n = len(Y)
+    ax = ax or plt.figure().add_subplot()
+    o = np.random.default_rng(0).permutation(len(Y))
+    kw = dict(s=max(0.5, 7000 / len(Y)) if s is None else s, lw=0, rasterized=True)
 
-    sx = _norm01(x, log=x_log) if x_pass else np.zeros(n)
-    sy = (
-        (np.sqrt(_norm01(y, floor0=True)) if y_sqrt else _norm01(y, floor0=True))
-        if y_pass
-        else np.zeros(n)
-    )
-
-    mode = "both" if x_pass and y_pass else "x" if x_pass else "y" if y_pass else "none"
-    sev = {"both": np.maximum(sx, sy), "x": sx, "y": sy, "none": np.zeros(n)}[mode]
-
-    # a dropped axis stays 0 and is never quantised, which would read as the top bin
-    qx = _quantize(sx, steps) if steps and x_pass else sx
-    qy = _quantize(sy, steps) if steps and y_pass else sy
-
-    col = _bivar_mix(qx, qy, cols)
-
-    # per-cell ambient occlusion
-    if shade is not None:
-        col = col * np.clip(np.asarray(shade, float), 0.0, 1.0)[:, None]
-
-    if highlight is not None and mode != "none":
-        thresh, low = (
-            np.percentile(sev, highlight),
-            np.percentile(sev, max(highlight - 25, 0)),
+    if values is not None:
+        values = np.asarray(values, float)
+        o = (
+            o
+            if order == "random"
+            else np.argsort(values if order == "high" else -values)
         )
-        fade = np.clip((sev - low) / (thresh - low + 1e-9), 0, 1)[:, None]
-        col = col * fade + np.array([0.93, 0.93, 0.92]) * (1 - fade)
+        kw.update(c=values[o], cmap=cmap, norm=norm)
+    elif labels is not None:
+        labels = np.asarray(labels).astype(str)
+        colours = colours or palette(labels)
+        kw.update(c=[colours[c] for c in labels[o]])
+    else:
+        kw.update(c="0.3")
 
-    # worst cells drawn last, on top
-    order = np.argsort(sev)
+    ax.scatter(*Y[o].T, **kw)
+    frame(ax, Y, crop)
 
-    if threed:
-        if ax is None:
-            ax = plt.gcf().add_subplot(projection="3d")
-
-        # fade the far tail to background and draw back to front
-        if fog:
-            order, weight, near = depth_fog(Y, elev, azim, fog_strength)
-            col = col * weight + np.array([1.0, 1.0, 1.0]) * (1 - weight)
-            # a steep size gradient reinforces depth
-            size = s * (0.3 + 1.3 * near)
-            ax.view_init(elev=elev, azim=azim)
-        else:
-            size = np.full(len(Y), float(s))
-
-        ax.scatter(
-            Y[order, 0],
-            Y[order, 1],
-            Y[order, 2],
-            s=size[order],
-            c=col[order],
-            linewidths=0,
-            depthshade=False,
-            rasterized=True,
+    if text:
+        box = dict(boxstyle="round,pad=0.25", fc="white", ec="none")
+        ax.text(
+            0.03, 0.03, text, transform=ax.transAxes, fontsize=6.5, bbox=box, zorder=10
         )
 
-        _bare3d(ax)
+    return ax
 
-        if legend and mode != "none":
-            # top-left, since a 3D bbox gives no per-corner data count to pick from
-            _bivar_key(ax, mode, cols, steps, 0, xlabel, ylabel)
 
-        return ax
+def plot_frontier(results, styles=None, ax=None, xlabel="recall@15", ylabel="CPD"):
+    # the local-to-global trade-off: per method the mean over runs with one-sd bars;
+    # results maps a method to its (recalls, CPDs), styles to its (colour, marker)
+    ax = ax or plt.figure().add_subplot()
 
-    ax = ax or plt.gca()
-    ax.scatter(
-        Y[order, 0], Y[order, 1], s=s, c=col[order], linewidths=0, rasterized=True
+    for i, (m, (r, c)) in enumerate(results.items()):
+        colour, marker = (styles or {}).get(m, (f"C{i}", "o"))
+        (x, dx), (y, dy) = (np.mean(r), np.std(r)), (np.mean(c), np.std(c))
+        kw = dict(color=colour, lw=0, zorder=3)
+        ax.errorbar(x, y, dy, dx, elinewidth=0.6, alpha=0.5, **kw)
+        ms = 7.5 if marker == "*" else 6
+        ax.plot(x, y, marker=marker, ms=ms, mew=0.6, mec="w", label=m, **kw)
+
+    ax.grid(True, lw=0.4, color="0.88")
+    ax.set_axisbelow(True)
+    ax.margins(0.13)
+    ax.set(xlabel=xlabel, ylabel=ylabel)
+
+    return ax
+
+
+def plot_ranks(ranks, ax=None, colours=None, margin=0.1, alpha=0.05):
+    # the empirical law of certificate ranks (cert["fibre"]["ranks"], ...) against the
+    # diagonal, with the DKW band at their count and the certificate's margin
+    ranks = [np.asarray(ranks)] if np.ndim(ranks[0]) == 0 else list(ranks)
+    ax = ax or plt.figure().add_subplot()
+    g = np.linspace(0, 1, 201)
+    eps = np.sqrt(np.log(2.0 / alpha) / (2.0 * len(ranks[0])))
+    ax.fill_between(
+        g, np.clip(g - eps, 0, 1), np.clip(g + eps, 0, 1), color="0.88", lw=0
     )
-    _bare(ax)
 
-    if legend and mode != "none":
-        _bivar_key(ax, mode, cols, steps, _emptiest_corner(Y, ax), xlabel, ylabel)
+    for m in (-margin, margin):
+        ax.plot(g, np.clip(g + m, 0, 1), color="0.55", lw=0.5, ls=(0, (2, 2)))
+
+    ax.plot([0, 1], [0, 1], color="0.2", lw=0.6)
+
+    for i, r in enumerate(ranks):
+        c = colours[i] if colours is not None else f"C{i}"
+        y = np.arange(1, len(r) + 1) / len(r)
+        ax.step(np.sort(r), y, where="post", color=c, lw=0.8)
+
+    ax.set(
+        xlim=(0, 1), ylim=(0, 1), aspect="equal", xticks=[0, 0.5, 1], yticks=[0, 0.5, 1]
+    )
+    ax.set_xlabel("held-out rank")
+
+    return ax
+
+
+def plot_paths(
+    Y,
+    paths,
+    labels=None,
+    colours=None,
+    ends=None,
+    far=None,
+    highlight=None,
+    ax=None,
+    crop=(1, 99),
+):
+    # paths drawn over the map, each from a dot to an arrowhead; far marks the steps with
+    # no training cell nearby (white dashes), ends names the two ends of each path as
+    # ((text, colour), (text, colour)), and cells outside highlight are grey
+    ax = ax or plt.figure().add_subplot()
+    on = np.ones(len(Y), bool) if highlight is None else np.asarray(highlight)
+    c = "0.3"
+
+    if labels is not None:
+        labels = np.asarray(labels).astype(str)
+        colours = colours or palette(labels)
+        c = np.array([colours[x] for x in labels[on]])
+
+    ax.scatter(*Y[~on].T, s=0.6, c="0.85", lw=0, rasterized=True)
+    ax.scatter(*Y[on].T, s=0.6, c=c, lw=0, rasterized=True)
+    frame(ax, np.vstack([Y[on], *paths]), crop, pad=0.1)
+    span = np.diff(ax.get_xlim())[0]
+    arrow = dict(arrowstyle="-|>", color="k", lw=1.0, mutation_scale=7)
+    box = dict(boxstyle="round,pad=0.1", fc="w", ec="none")
+
+    for p, path in enumerate(paths):
+        ax.plot(*path.T, c="k", lw=1.0, solid_capstyle="round", zorder=4)
+
+        if far is not None:
+            dashed = np.where(np.asarray(far[p])[:, None], path, np.nan)
+            ax.plot(*dashed.T, c="w", lw=0.6, ls=(0, (1.5, 1.5)), zorder=5)
+
+        ax.scatter(*path[0], s=10, c="k", lw=0, zorder=5)
+        ax.annotate("", xy=path[-1], xytext=path[-4], arrowprops=arrow, zorder=5)
+
+        for (text, colour), xy, nb in zip(
+            ends[p] if ends else (), path[[0, -1]], path[[6, -7]]
+        ):
+            u = (xy - nb) / (np.linalg.norm(xy - nb) + 1e-9)
+            # darkened, so a light class colour still reads as text on white
+            dark = 0.55 * np.array(to_rgb(colour))
+            kw = dict(ha="center", va="center", zorder=6, bbox=box, fontsize=7)
+            ax.text(*(xy + 0.07 * span * u), text, color=dark, **kw)
+
+    return ax
+
+
+def plot_band(
+    lo,
+    hi,
+    mean,
+    near=None,
+    far=None,
+    label=None,
+    ax=None,
+    colours=("#DCD3DC", "#AA4499", "#2E8B7A"),
+):
+    # a quantity decoded along a path: the band from lo to hi, the mean of the draws,
+    # ticks for the mean of the nearest training cells, grey where none is near
+    ax = ax or plt.figure().add_subplot()
+    band, colour, near_colour = colours
+    x = np.linspace(0, 1, len(lo))
+
+    if far is not None:
+        edges = np.flatnonzero(np.diff(np.r_[0, np.asarray(far, int), 0]))
+
+        for s, e in zip(edges[::2], edges[1::2]):
+            ax.axvspan(x[s], x[e - 1], color="0.93", lw=0, zorder=0)
+
+    ax.fill_between(x, lo, hi, color=band, lw=0, zorder=1)
+    ax.plot(x, mean, c=colour, lw=1.0, zorder=3)
+    ymin, ymax = np.nanmin(lo), np.nanmax(hi)
+
+    if near is not None:
+        t = np.linspace(0, len(x) - 1, 18).round().astype(int)
+        ax.scatter(x[t], near[t], marker="_", s=14, lw=0.9, c=near_colour, zorder=4)
+        ymin, ymax = min(ymin, np.min(near)), max(ymax, np.max(near))
+
+    pad = 0.06 * (ymax - ymin)
+    ax.set(xlim=(0, 1), ylim=(ymin - pad, ymax + pad), xticks=[0, 1])
+    ax.set_xticklabels(["start", "end"])
+    ax.spines[["top", "right"]].set_visible(False)
+
+    if label:
+        ax.text(0.99, 0.97, label, transform=ax.transAxes, ha="right", va="top")
 
     return ax
 
