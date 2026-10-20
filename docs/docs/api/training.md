@@ -9,8 +9,7 @@ The estimator covers normal use. These parts are exported for custom training an
 
 ## `TrainConfig`
 
-A dataclass with every setting of a training run. `FloDR(advanced=...)` overrides its fields by name. The fields most
-often changed are listed in [Fitting](../guide/fitting.md#advanced).
+A dataclass with every setting of a training run. `FloDR(advanced=...)` overrides its fields by name.
 
 ## `raw_recipe(seed=0, threads=None, **overrides)`
 
@@ -37,7 +36,7 @@ One affine coupling layer of the flow.
 |---|---|
 | `raw_coords(X, n_components=50, seed=0)` | the PCA whitening, with its forward and inverse maps |
 | `fuzzy_knn_graph(Xp, k, ...)` | the fuzzy neighbour graph used for training |
-| `knn_search(Xp, k, exact=None)` | nearest neighbours of every point |
+| `knn_search(Xp, k, exact=None, device=None)` | nearest neighbours of every point, exact on the GPU |
 | `global_pairs(Xp, count, rng)` | random pairs for the global terms |
 | `find_ab(min_dist=0.1, spread=1.0)` | the parameters of the layout kernel |
 | `preprocess(X, n_components=50, seed=0, ...)` | PCA to at most `n_components` components scaled to unit variance, optionally with its inverse and transform |

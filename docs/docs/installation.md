@@ -26,7 +26,7 @@ import flodr
 flodr.default_device()  # "cuda" when PyTorch sees a GPU, otherwise "cpu"
 ```
 
-FloDR runs on the CPU as well, several times slower. See [Performance](guide/performance.md).
+FloDR runs on the CPU as well, several times slower.
 
 ## From source
 

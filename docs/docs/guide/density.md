@@ -1,53 +1,44 @@
 ---
 title: Density
-sidebar_position: 5
+sidebar_position: 4
 ---
 
 # Density
 
-With `density=True`, the default, a fitted model is also a density model of its input.
-
 ```python
-logp = model.score_samples(X)   # (n,) log density of each row
-mean_logp = model.score(X)      # the mean of score_samples
+logp = model.score_samples(X)               # log p(x), per point
+model.score(X)                              # the mean, for GridSearchCV
 ```
 
-## How the density is built
+The density is fitted after the layout, under a small input noise. Its values are worth reading only where it is a
+law of the data, so test it on points the model has not seen.
 
-The change of variables formula gives the density of an input from the density of its latent vector and the
-Jacobian of the flow. The latent density has two parts. One is a density over positions of the layout. The other
-is a Gaussian over the residual whose mean and variance depend on the position, preceded by a few extra coupling
-layers that leave the layout coordinates unchanged.
-
-Training includes a likelihood term, so the whole map is shaped as a density model while it learns the layout. The
-position-dependent part is fitted after training, at the first call that needs it, which is why the first density
-call after `fit` takes longer than the ones after it.
-
-## Units and comparisons
-
-`score_samples` returns the natural logarithm of the density of the whitened input, which differs from the density
-of the raw input by a constant for a given training set. Values compare between points of one model, and between
-models fitted to the same data. They do not compare between models fitted to different data.
-
-For padded inputs the density includes the padding columns, set to zero for the evaluated points. See
-[Choosing the input](inputs.md#narrow-inputs).
-
-## Model selection
-
-`score` is the mean log density, so scikit-learn model selection uses held-out likelihood when no other scorer is
-given.
+## Certificates
 
 ```python
-from sklearn.model_selection import GridSearchCV
-
-search = GridSearchCV(FloDR(max_iter=1600), {"w": [1.0, 2.0, 3.0]}, cv=3).fit(X)
-search.best_params_
+cert = model.coverage_certificate(X_test)
+cert["certifies"]                           # "certified", "refused" or "undecided"
+energy = model.energy_certificate(X_test)
+scale = model.faithful_scale(X_test)
 ```
 
-Each candidate is fitted once per fold, so a search costs as many fits as candidates times folds.
+`coverage_certificate` ranks each held-out point among exact draws of the density at its own position (`fibre`) and
+among draws of positions (`map`). Both ranks are uniform when the density is right; the verdict is an equivalence test
+at `margin=0.1`. Without `X` it refits the density on half the training points and tests it on the other half.
+`cert["flagged"]` lists the map regions where coverage falls short. `viz.plot_ranks` draws the ranks.
 
-## Without the density
+`energy_certificate` ranks held-out points by their input distance to the draws at their position, which also
+catches draws that are too wide. `faithful_scale` reports, per point, how far the decode stays near-linear at the
+density's input noise (`rho`, `hstar`).
 
-`FloDR(density=False)` skips the likelihood term and the conditional fit. `score_samples` and `score` are then
-absent, and `hasattr(model, "score")` is `False`. `conditional_spread`, `atypicality` and `spread_calibration` raise a
-`ValueError`. `hidden_contrast` still works.
+## Bands along the map
+
+```python
+from flodr.conformal import conformal_bands
+
+bands = conformal_bands(model, X_calib, Y_path, readout=W)  # lo, hi per position
+```
+
+The bands hold the inputs at each position at level `1 - alpha` (0.9 by default), calibrated split-conformally on
+held-out points `X_calib`. `readout` maps inputs to what you want to read, a matrix (e.g. PCA loadings back to genes)
+or a function. `viz.plot_band` draws them along a path.

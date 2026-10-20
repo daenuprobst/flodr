@@ -5,57 +5,17 @@ sidebar_position: 2
 
 # `flodr.viz`
 
-Plotting helpers built on matplotlib, and the functions behind the diagnostics.
+Every plotting function takes `ax=None` (a new axes) and returns the axes. See [Visualisation](../guide/visualisation.md).
 
-## Plotting
+| Function | Draws |
+|---|---|
+| `plot_embedding(Y, labels=None, values=None, colours=None, cmap="viridis", norm=None, s=None, order="random", crop=(1, 99), text=None)` | a map coloured by label (`colours`: label to colour) or by value; `order="high"` draws high values last |
+| `plot_frontier(results, styles=None, xlabel="recall@15", ylabel="CPD")` | per method the mean and sd of `(recalls, cpds)`; `styles`: method to `(colour, marker)` |
+| `plot_ranks(ranks, colours=None, margin=0.1, alpha=0.05)` | the empirical law of certificate ranks against the diagonal, with the DKW band and the margin |
+| `plot_paths(Y, paths, labels=None, colours=None, ends=None, far=None, highlight=None, crop=(1, 99))` | paths over a map; `ends` names their ends, `far` dashes steps far from the training points |
+| `plot_band(lo, hi, mean, near=None, far=None, label=None)` | a value decoded along a path, with its band |
+| `plot_audit(res, axes=None, show_labels=True)` | the result of `flodr.audit`: the labels and the hidden information |
+| `frame(ax, Y, crop=(1, 99), pad=0.03)` | sets a square 1:1 window around the map |
+| `save(fig, path, dpi=300)` | saves with tight bounds |
 
-### `plot_embedding(Y, labels=None, ax=None, cmap="tab10", s=6, title=None)`
-
-Draws the layout `Y` as a scatter, coloured by `labels` when given, and returns the axes.
-
-### `plot_field(Y, v, ax=None, cmap="Reds", s=8)`
-
-Draws the layout coloured by one value per point, such as `conditional_spread`, with a colour bar, and returns the
-axes.
-
-### `bivariate_field(Y, x, y, ax=None, scheme="accessible", ...)`
-
-Draws two fields over one layout with a two-dimensional colour key. Useful for the spread and the hidden contrast
-together.
-
-### `occupancy_field(Y, n_grid=100, scale=5.0, pad=0.06)`
-
-Returns grid axes over the layout and a soft mask of where the layout has points.
-
-### `depth_fog(Y, elev=22.0, azim=-60.0, strength=0.9, gamma=2.4)`
-
-For three-dimensional layouts. Returns a drawing order, a colour weight and a depth per point for a view from
-`elev` and `azim`.
-
-### `save(fig, path, dpi=300)`
-
-Saves a figure with tight bounds.
-
-### `RC`, `RC_PAPER`
-
-Matplotlib settings for the screen and for print, for use with `matplotlib.rc_context`.
-
-## Diagnostics
-
-These take a trained flow directly and are what the estimator's methods call.
-
-### `conditional_spread(flow, Y, to_input=None, n_samples=64, seed=0, chunk=1024)`
-
-The spread of decoded inputs at the positions `Y`.
-
-### `conditional_moments(flow, Y, to_input=None, n_samples=64, seed=0, chunk=1024)`
-
-The mean and the spread of decoded inputs at the positions `Y`.
-
-### `conditional_atypicality(flow, Z, to_input=None, n_samples=128, seed=0, chunk=512)`
-
-The atypicality of the points with latent coordinates `Z`.
-
-### `residual(flow, X)`, `residual_fraction(flow, X)`
-
-The residual coordinates of whitened inputs `X`, and the median share of the latent norm they carry.
+`RC` is a matplotlib style for screen figures.
