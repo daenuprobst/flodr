@@ -1,9 +1,6 @@
 ---
 title: Installation
-sidebar_position: 2
 ---
-
-# Installation
 
 FloDR is on PyPI and needs Python 3.11 or newer. It trains with PyTorch and uses the GPU when one is available.
 

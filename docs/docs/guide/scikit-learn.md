@@ -1,9 +1,6 @@
 ---
 title: scikit-learn
-sidebar_position: 7
 ---
-
-# scikit-learn
 
 `FloDR` is a scikit-learn transformer: it clones, sits in a `Pipeline` and returns DataFrames on request.
 

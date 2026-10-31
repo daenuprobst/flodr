@@ -1,9 +1,6 @@
 ---
 title: Quickstart
-sidebar_position: 3
 ---
-
-# Quickstart
 
 ```python
 import matplotlib.pyplot as plt

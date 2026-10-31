@@ -1,9 +1,6 @@
 ---
 title: Visualisation
-sidebar_position: 6
 ---
-
-# Visualisation
 
 `flodr.viz` draws the plots of the FloDR paper. Every function takes an `ax` (one is created when it is `None`) and
 returns it; maps are square boxes at 1:1 data scale.

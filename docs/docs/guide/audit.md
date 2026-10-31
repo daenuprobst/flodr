@@ -1,9 +1,6 @@
 ---
 title: Hidden information
-sidebar_position: 5
 ---
-
-# Hidden information
 
 ```python
 from flodr import audit, plot_audit

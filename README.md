@@ -61,6 +61,9 @@ uv sync --extra dev
 uv run pytest
 ```
 
+The documentation is a Starlight site built from `docs/docs/*.md` and the signatures in `src/flodr`:
+`cd docs && npm install && npm run dev`.
+
 ## Reproducing the paper
 
 `scripts/` holds one script per figure and table of the paper, named after it (`fig2.py`, `ed_table1.py`,

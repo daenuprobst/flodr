@@ -1,0 +1,13 @@
+:root {
+	/* room for 80-character signatures */
+	--sl-content-width: 50rem;
+	--sl-color-accent-low: #3d1f05;
+	--sl-color-accent: #e06c09;
+	--sl-color-accent-high: #f6c290;
+}
+
+:root[data-theme='light'] {
+	--sl-color-accent-low: #fbe3cc;
+	--sl-color-accent: #c25e08;
+	--sl-color-accent-high: #5a2d04;
+}

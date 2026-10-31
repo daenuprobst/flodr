@@ -1,9 +1,6 @@
 ---
 title: The inverse
-sidebar_position: 3
 ---
-
-# The inverse
 
 ```python
 Z = model.transform_latent(X)       # (n, d): the map, then the residual

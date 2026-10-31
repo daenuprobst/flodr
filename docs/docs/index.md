@@ -1,10 +1,6 @@
 ---
-slug: /
 title: FloDR
-sidebar_position: 1
 ---
-
-# FloDR
 
 FloDR is a dimensionality reduction method built on an invertible normalising flow. The first `n_components`
 coordinates of the flow are the map and the rest are a residual, so the fitted map has an exact inverse and an exact

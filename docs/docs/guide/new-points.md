@@ -1,9 +1,6 @@
 ---
 title: New points
-sidebar_position: 2
 ---
-
-# New points
 
 ```python
 Y_new = model.transform(X_new)        # one forward pass, milliseconds

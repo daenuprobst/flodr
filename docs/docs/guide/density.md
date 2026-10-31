@@ -1,9 +1,6 @@
 ---
 title: Density
-sidebar_position: 4
 ---
-
-# Density
 
 ```python
 logp = model.score_samples(X)               # log p(x), per point

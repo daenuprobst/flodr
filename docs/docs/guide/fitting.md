@@ -1,9 +1,6 @@
 ---
 title: Fitting
-sidebar_position: 1
 ---
-
-# Fitting
 
 ```python
 model = FloDR(n_components=2, w=2.0, axes="variance", density=True, random_state=0).fit(X)
