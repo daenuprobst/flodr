@@ -19,3 +19,8 @@ viz.save(fig, "figure.pdf")
 ```
 
 `viz.RC` is a matplotlib style for screen figures: `plt.rcParams.update(viz.RC)`.
+
+![recall@15 against CPD for five methods on paul15 and Fashion-MNIST](../images/frontier.png)
+
+`plot_frontier` in the [benchmark](../examples/benchmark.md). The figures in these pages come from the examples,
+which use `flodr.viz` throughout.
