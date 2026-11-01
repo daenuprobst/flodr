@@ -5,7 +5,6 @@ import warnings
 
 import numpy as np
 import torch
-from scipy.spatial import cKDTree
 from sklearn.base import (
     BaseEstimator,
     ClassNamePrefixFeaturesOutMixin,
@@ -15,13 +14,20 @@ from sklearn.utils import check_array, check_random_state
 from sklearn.utils.metaestimators import available_if
 from sklearn.utils.validation import check_is_fitted, validate_data
 
-from . import viz
-from .data import find_ab, fuzzy_knn_graph, knn_query, raw_coords
-from .model import graph_loop
+from . import fidelity
+from .data import (
+    RotatedWhitening,
+    Whitening,
+    find_ab,
+    fuzzy_knn_graph,
+    knn_query,
+    raw_coords,
+)
+from .heat import heat_coordinates, heat_rotation
+from .model import ENERGY_GRID
 from .train import TrainConfig, default_device, raw_recipe, train_flodr
 
-# keeping the heaviest quarter of the fuzzy graph is +32 to +41% recall between 50k and
-# 500k points, flat past a million, and costs recall below 10k
+# in this size range the heaviest quarter of the fuzzy graph keeps more neighbours
 PRUNE_KEEP = 0.25
 PRUNE_RANGE = (50_000, 500_000)
 
@@ -49,6 +55,37 @@ def _flow_to(flow, dev):
     return flow
 
 
+def _pushed_sd(coords_of, X, sigma):
+    # per-axis sd of isotropic input noise after coords_of, from the map's Jacobian by central
+    # differences at the data mean; exact for a linear map
+    x0 = np.asarray(X, np.float64).mean(0)
+    step = sigma * np.sqrt(len(x0))
+    up = (x0 + step * np.eye(len(x0))).astype(np.float32)
+    down = (x0 - step * np.eye(len(x0))).astype(np.float32)
+    # the steps as the float32 inputs carry them
+    width = np.diag(up.astype(np.float64) - down.astype(np.float64))
+    J = np.asarray(coords_of(up), np.float64) - np.asarray(coords_of(down), np.float64)
+    J /= width[:, None]
+
+    return sigma * np.sqrt((J**2).sum(0))
+
+
+def _axis_sd(Z, chunk=65536):
+    # float64 for axes with an sd near 5e-7, in chunks to bound memory
+    mu = np.zeros(Z.shape[1])
+
+    for i in range(0, len(Z), chunk):
+        mu += Z[i : i + chunk].sum(0, dtype=np.float64)
+
+    mu /= len(Z)
+    ss = np.zeros(Z.shape[1])
+
+    for i in range(0, len(Z), chunk):
+        ss += ((Z[i : i + chunk] - mu) ** 2).sum(0)
+
+    return np.sqrt(ss / len(Z))
+
+
 def _has_density(est):
     # hides score and score_samples from hasattr without a density, as sklearn expects
     if not est.density:
@@ -60,8 +97,14 @@ def _has_density(est):
 
 
 class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
-    # the recipe behind the paper's main comparison, deliberately not user knobs
-    _FROZEN = dict(n_neighbors=15, pca_head=50, stress_ordinal=True)
+    # fixed parts of the recipe, not user settings; farthest-point landmarks cover rare branches
+    _FROZEN = dict(
+        n_neighbors=15,
+        pca_head=50,
+        stress_ordinal=True,
+        density_noise_cap=0.5,
+        heat_landmarks="farthest",
+    )
 
     def __init__(
         self,
@@ -74,6 +117,7 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
         device=None,
         verbose=True,
         advanced=None,
+        axes="variance",
     ):
         self.n_components = n_components
         self.w = w
@@ -83,6 +127,7 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
         self.device = device
         self.verbose = verbose
         self.advanced = advanced
+        self.axes = axes
 
     def __sklearn_tags__(self):
         tags = super().__sklearn_tags__()
@@ -101,11 +146,13 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
 
         return state
 
+    # a model fitted on CUDA moves to the GPU while it is unpickled, when there is one
     def __setstate__(self, state):
         super().__setstate__(state)
-        cuda = str(getattr(self, "_device", "cpu")).startswith("cuda")
 
-        if "flow_" in state and cuda and torch.cuda.is_available():
+        cuda = str(self._device).startswith("cuda") if "flow_" in state else False
+
+        if cuda and torch.cuda.is_available():
             _flow_to(self.flow_, self._device)
 
     @staticmethod
@@ -130,6 +177,9 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
         if not (isinstance(self.w, numbers.Real) and self.w >= 0):
             raise ValueError(f"w must be a number >= 0, got {self.w!r}")
 
+        if self.axes not in ("variance", "heat"):
+            raise ValueError(f"axes must be 'variance' or 'heat', got {self.axes!r}")
+
         if max_iter is not None and not (
             isinstance(max_iter, numbers.Integral) and max_iter >= 1
         ):
@@ -143,6 +193,13 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
 
         if bad:
             raise ValueError(f"advanced keys {bad} are not TrainConfig fields")
+
+        select = (self.advanced or {}).get("tail_select", "auto")
+
+        if select not in ("auto", "energy", "coverage"):
+            raise ValueError(
+                f"tail_select must be 'auto', 'energy' or 'coverage', got {select!r}"
+            )
 
     def _seed_from(self):
         rs = self.random_state
@@ -170,36 +227,16 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
             )
 
         if self.density:
-            kw.setdefault("w_nll", 0.5)
+            # the density is fitted after the layout: a likelihood term in the layout fit
+            # flattens the training cells' residual without improving the layout
+            kw.setdefault("w_nll", 0.0)
             kw.setdefault("cond_tail", 2)
 
         kw.setdefault("k", self.n_components)
         return raw_recipe(seed=self._seed, device=self._device, **kw)
 
-    def _fit_args(self, iters, progress):
-        # fit(iters=..., progress=...) predate max_iter and verbose
-        if iters != "deprecated":
-            warnings.warn(
-                "fit(iters=...) is deprecated; use FloDR(max_iter=...)",
-                FutureWarning,
-                stacklevel=3,
-            )
-
-        if progress != "deprecated":
-            warnings.warn(
-                "fit(progress=...) is deprecated; use FloDR(verbose=...)",
-                FutureWarning,
-                stacklevel=3,
-            )
-
-        return (
-            self.max_iter if iters == "deprecated" else iters,
-            self.verbose if progress == "deprecated" else progress,
-        )
-
-    def fit(self, X, y=None, iters="deprecated", progress="deprecated"):
-        max_iter, verbose = self._fit_args(iters, progress)
-        self._check_params(max_iter)
+    def fit(self, X, y=None):
+        self._check_params(self.max_iter)
         X = validate_data(
             self, X, dtype=np.float32, ensure_min_samples=2, ensure_min_features=2
         )
@@ -208,14 +245,13 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
 
         # below 16 points every other point is a neighbour
         self._k = min(self._FROZEN["n_neighbors"], len(X) - 1)
-        self._cfg = self._config(X, max_iter)
+        self._cfg = self._config(X, self.max_iter)
         Z, self._raw_of, self._coords_of = raw_coords(
             X, self._FROZEN["pca_head"], self._seed
         )
 
-        # noise columns widen the residual the layout is routed through on narrow inputs.
-        # new points get zeros there, and _to_raw drops them. padding a 50-D input
-        # breaks the spread certificate
+        # noise columns widen the residual of narrow inputs; new points get zeros there and
+        # _to_raw drops them
         self._d_z = Z.shape[1]
         self._n_pad = max(0, self._cfg.pad - self._d_z)
         noise = np.random.default_rng(self._seed + 4242).standard_normal(
@@ -237,14 +273,66 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
             if self._metric == "jaccard"
             else None
         )
+        # gpu_exact, faiss_exact, usearch_exact, hnsw (approximate) or jaccard_exact
+        info = dict(knn="jaccard_exact" if pre is not None else "unrecorded")
         self.knn_idx_, edge_i, edge_j, w_attr, self.knn_dist_ = fuzzy_knn_graph(
-            X, self._k, precomputed=pre, return_dist=True
+            X,
+            self._k,
+            precomputed=pre,
+            return_dist=True,
+            device=self._device,
+            info=info,
         )
+        self.knn_backend_ = info["knn"]
+
+        # axes="heat" starts the flow from the heat geometry of the graph instead of the leading
+        # principal components; the layout keeps the arrangement it starts from. The rotation is
+        # orthogonal and undone on the way back, so the inverse stays exact
+        wh = getattr(self._raw_of, "__self__", None)
+
+        if self.axes == "heat" and isinstance(wh, Whitening):
+            P = heat_coordinates(
+                self.knn_dist_,
+                self.knn_idx_,
+                self.n_components,
+                self._device,
+                self._seed,
+                self._FROZEN["heat_landmarks"],
+                X,
+            )
+            R = heat_rotation(Z[:, : wh.n_head], P)
+            Z[:, : wh.n_head] = Z[:, : wh.n_head] @ R
+            rot = RotatedWhitening(wh, R)
+            self._raw_of, self._coords_of = rot.to_raw, rot.to_coords
+
         keep = prune_fraction(len(X))
 
         if keep < 1.0:
             sel = np.sort(np.argsort(-w_attr)[: round(keep * len(w_attr))])
             edge_i, edge_j, w_attr = edge_i[sel], edge_j[sel], w_attr[sel]
+
+        # the density's input noise: isotropic in X, diagonal in the latent; none on the padding
+        # columns or on binary inputs
+        sd = None
+
+        if self.density and self._cfg.density_noise and self._metric == "euclid":
+            wh = getattr(self._raw_of, "__self__", None)
+            sigma = self._cfg.density_noise * float(np.median(self.knn_dist_[:, 0]))
+            sigma /= np.sqrt(X.shape[1])
+            if isinstance(wh, Whitening):
+                sd = np.concatenate(
+                    [sigma / wh.head_sd, sigma / wh.tail_sd, np.zeros(self._n_pad)]
+                )
+            else:
+                # a rotated whitening, so the noise goes through the map itself
+                sd = np.concatenate(
+                    [_pushed_sd(self._coords_of, X, sigma), np.zeros(self._n_pad)]
+                )
+            # at most half of each axis's own spread, so near-constant axes get no large noise
+            sd = np.minimum(sd, self._FROZEN["density_noise_cap"] * _axis_sd(Z))
+
+        # the linearity term steps at that noise
+        lin = dict(noise_sd=sd) if sd is not None and self._cfg.w_lin else {}
 
         Y, roundtrip, _, flow = train_flodr(
             Z,
@@ -255,7 +343,8 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
             return_model=True,
             w=w_attr,
             stress_X=X,
-            progress=verbose,
+            progress=self.verbose,
+            **lin,
         )
 
         self.embedding_, self.roundtrip_, self.flow_ = (
@@ -263,19 +352,58 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
             float(roundtrip),
             flow,
         )
+        self.step_mode_ = getattr(flow, "_step_mode", "eager")
+        bad = int((~np.isfinite(self.embedding_)).any(1).sum())
+
+        # CUDA fits vary between runs, so a refit at the same seed can succeed
+        if bad:
+            warnings.warn(
+                f"the fit returned non-finite coordinates for {bad} of {len(X)} points; "
+                "refit, at the same or another random_state",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
         self.n_iter_ = self._cfg.iters
         self._n_features_out = self.n_components
 
         self._coords = Z
         self._X = X
 
+        self.density_sigma_ = 0.0
+
+        if sd is not None:
+            self.flow_._density_noise = torch.as_tensor(
+                sd, dtype=torch.float32, device=next(self.flow_.parameters()).device
+            )
+            self.density_sigma_ = float(sigma)
+
+        # on the flow, so a deferred density fit makes the same choice
+        if self.density:
+            self.flow_._tail_kw = self._tail_kw()
+
         return self
 
-    def fit_transform(self, X, y=None, iters="deprecated", progress="deprecated"):
-        return self.fit(X, iters=iters, progress=progress).embedding_
+    def _tail_kw(self):
+        cfg = self._cfg
 
-    # the fitted whitening; narrow inputs drop their noise columns on the way out and get
-    # zeros there on the way in
+        # the energy-selected tail only with the linearity term
+        if cfg.tail_select == "coverage" or (
+            cfg.tail_select == "auto" and not cfg.w_lin
+        ):
+            return dict(select="coverage")
+
+        A, b = fidelity._raw_affine(self)
+
+        return dict(
+            select="energy",
+            grid=ENERGY_GRID,
+            raw=(A.astype(np.float32), b.astype(np.float32)),
+        )
+
+    def fit_transform(self, X, y=None):
+        return self.fit(X).embedding_
+
     def _to_raw(self, Zn):
         return self._raw_of(np.asarray(Zn)[:, : self._d_z])
 
@@ -329,6 +457,7 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
 
         return self._forward(X).cpu().numpy()
 
+    # decodes [y, 0]: the residual set to zero
     def inverse_transform(self, Y):
         check_is_fitted(self)
         Y = check_array(Y, dtype=np.float32)
@@ -365,28 +494,41 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
 
             return self._to_raw(self.flow_.inverse(z).cpu().numpy())
 
-    def inverse_coords(self, Zlat):
-        warnings.warn(
-            "inverse_coords is deprecated; use inverse_latent",
-            FutureWarning,
-            stacklevel=2,
-        )
-
-        return self.inverse_latent(Zlat)
-
     @available_if(_has_density)
     def score_samples(self, X):
         check_is_fitted(self)
         X = validate_data(self, X, dtype=np.float32, reset=False)
         self._need_density()
 
-        # log_prob runs the flow itself, so it takes latent coords. passing _forward(X)
-        # would apply the flow twice and return the wrong Jacobian with it
+        # log_prob runs the flow itself, so it takes the whitened coordinates
         dev = next(self.flow_.parameters()).device
         z = torch.from_numpy(self._to_coords(X)).float().to(dev)
 
         with torch.no_grad():
-            return self.flow_.log_prob(z).cpu().numpy()
+            if not self._n_pad:
+                return self.flow_.log_prob(z).cpu().numpy()
+
+            return self._pad_marginal(z, 128).cpu().numpy()
+
+    # the density was fitted with N(0, 1) noise in the padding columns, so a point's density is
+    # the marginal over them by importance sampling from that law:
+    # log p(x) = logmeanexp_k [log p(x, e_k) - log phi(e_k)]. The draws are fixed by
+    # random_state and shared by all points
+    def _pad_marginal(self, z, n_draws):
+        gen = torch.Generator().manual_seed(self._seed + 4244)
+        e = torch.randn((n_draws, self._n_pad), generator=gen).to(z.device)
+        log_phi = -0.5 * (e**2).sum(1) - 0.5 * self._n_pad * np.log(2 * np.pi)
+        rows = max(1, 131072 // n_draws)
+        out = []
+
+        for s in range(0, len(z), rows):
+            zc = z[s : s + rows]
+            zz = zc[None].repeat(n_draws, 1, 1)
+            zz[:, :, self._d_z :] = e[:, None, :]
+            lp = self.flow_.log_prob(zz.reshape(-1, zz.shape[-1])).reshape(n_draws, -1)
+            out.append(torch.logsumexp(lp - log_phi[:, None], 0) - np.log(n_draws))
+
+        return torch.cat(out)
 
     # mean log density per sample, so GridSearchCV can select on held-out likelihood
     @available_if(_has_density)
@@ -395,466 +537,214 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
 
     def _need_density(self):
         if not self.density:
-            raise ValueError(
-                "density is off. conditional_spread/atypicality are functionals of the fitted "
-                "p(r|y), which the raw recipe does not train (w_nll=0, cond_tail=0). Refit with "
-                "FloDR(density=True)."
-            )
+            raise ValueError("this needs the density; refit with FloDR(density=True)")
 
         if self.flow_._cond is None:
-            # capacity-selected, not the deferred fixed-capacity fit, because the fixed default
-            # memorises small samples and sigma(y) becomes noise between train points
+            # selected on held-out cells, since a fixed capacity memorises small samples
             self.flow_._density_args = None
-            self.flow_.fit_cond_tail_cv(self._coords, seed=self._seed)
+            self.flow_.fit_cond_tail_cv(
+                self._coords,
+                seed=self._seed,
+                noise_sd=self._density_sd(),
+                **getattr(self.flow_, "_tail_kw", {}),
+            )
 
-    def conditional_spread(self, Y=None, n_samples=64):
+    def _layout_bounds(self):
+        return self.embedding_.min(0), self.embedding_.max(0)
+
+    def _density_sd(self):
+        return getattr(self.flow_, "_density_noise", None)
+
+    # held-out cells are drawn from the density's own law: the cells plus one draw of its input noise
+    def _noised(self, xc):
+        sd = self._density_sd()
+
+        if sd is None:
+            return xc
+
+        rng = np.random.default_rng(self._seed + 47)
+
+        return (xc + sd.cpu().numpy() * rng.standard_normal(xc.shape)).astype(
+            np.float32
+        )
+
+    def coverage_certificate(
+        self, X=None, n_draws=199, margin=0.1, alpha=0.05, n_bins=14, min_pts=20
+    ):
         check_is_fitted(self)
         self._need_density()
-        Y = self.embedding_ if Y is None else np.asarray(Y, dtype=np.float32)
+        from scipy.stats import beta
 
-        return viz.conditional_spread(
-            self.flow_,
-            Y,
-            to_input=self._to_raw,
-            n_samples=n_samples,
-            seed=self._seed,
-        )
+        # held-out cells ranked among exact draws of the fitted law: each cell's
+        # l = log p(x) - log p(y) among draws from the fibre of its own pixel, and log p(y)
+        # among draws of the map density. Both ranks are uniform when the law is right,
+        # so the certificate is an equivalence band around the diagonal, not a p-value
+        k = self.n_components
+        rng = np.random.default_rng(self._seed + 41)
 
-    def atypicality(self, n_samples=128):
-        check_is_fitted(self)
-        self._need_density()
-
-        return viz.conditional_atypicality(
-            self.flow_,
-            self._coords,
-            to_input=self._to_raw,
-            n_samples=n_samples,
-            seed=self._seed,
-        )
-
-    def diagnostics(self, G=None, **kw):
-        check_is_fitted(self)
-        out = {}
-
-        if self.density:
-            sigma = np.asarray(self.conditional_spread())
-            out["spread"] = dict(
-                field=sigma,
-                cert=self.spread_calibration(),
-                units="input units",
-                label=r"$\sigma(y)$",
+        if X is None:
+            # a tail refitted on half the cells, certified on the other half
+            perm = rng.permutation(len(self._coords))
+            fold_a, fold_b = perm[: len(perm) // 2], perm[len(perm) // 2 :]
+            flow = copy.deepcopy(self.flow_)
+            flow._density_args = None
+            flow.tail, flow._cond = torch.nn.ModuleList(), None
+            flow.fit_cond_tail_cv(
+                self._coords[fold_a],
+                seed=self._seed,
+                noise_sd=self._density_sd(),
+                **getattr(flow, "_tail_kw", {}),
             )
-        if G is not None:
-            field, cert = self.hidden_contrast(G, **kw)
-            # absent when undecided
-            field_null = cert.pop("field_null", None)
-            out["hidden_contrast"] = dict(
-                field=field,
-                field_null=None if field_null is None else np.asarray(field_null),
-                cert=cert,
-                units="nats",
-                label=r"$I(G;R \mid Y{=}y)$",
-            )
-        return out
+            xc = np.asarray(self._coords[fold_b], np.float32)
+        else:
+            X = validate_data(self, X, dtype=np.float32, reset=False)
+            flow, xc = self.flow_, np.asarray(self._to_coords(X), np.float32)
 
-    def _class_logp_batched(
-        self, Xin, gRN, rows_fit, n_cls, hid, iters, seed, wd=1e-4, batch=1024
-    ):
-        dev = next(self.flow_.parameters()).device
-        R = len(gRN)
-        d_in = Xin.shape[1]
-        gen = torch.Generator(device=dev)
-        gen.manual_seed(seed)
+        xc = self._noised(xc)
 
-        def par(*shape, fan):
-            b = 1.0 / np.sqrt(fan)
-            return torch.nn.Parameter(
-                (torch.rand(*shape, generator=gen, device=dev) * 2 - 1) * b
-            )
-
-        W1, b1 = par(R, d_in, hid, fan=d_in), par(R, hid, fan=d_in)
-        W2, b2 = par(R, hid, hid, fan=hid), par(R, hid, fan=hid)
-        W3, b3 = par(R, hid, n_cls, fan=hid), par(R, n_cls, fan=hid)
-        params = [W1, b1, W2, b2, W3, b3]
-
-        Xt = torch.as_tensor(np.asarray(Xin, np.float32), device=dev)
-        # (R, n)
-        gt = torch.as_tensor(np.asarray(gRN, np.int64), device=dev)
-        fit_rows = torch.as_tensor(np.asarray(rows_fit, np.int64), device=dev)
-        opt = torch.optim.Adam(
-            params, lr=1e-3, weight_decay=wd, capturable=dev.type == "cuda"
-        )
-        bs = min(batch, len(rows_fit))
-        sel = torch.zeros(bs, dtype=torch.long, device=dev)
-
-        def fwd(xb):
-            h = torch.tanh(torch.einsum("bi,rih->rbh", xb, W1) + b1[:, None, :])
-            h = torch.tanh(torch.einsum("rbh,rhg->rbg", h, W2) + b2[:, None, :])
-
-            return torch.einsum("rbg,rgc->rbc", h, W3) + b3[:, None, :]
-
-        def draw():
-            sel.copy_(
-                fit_rows[
-                    torch.randint(0, len(fit_rows), (bs,), device=dev, generator=gen)
-                ]
-            )
-
-        def body():
-            # (R, bs, n_cls)
-            logits = fwd(Xt[sel])
-            loss = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, n_cls), gt[:, sel].reshape(-1)
-            )
-            opt.zero_grad(set_to_none=False)
-            loss.backward()
-            opt.step()
-
-        graph_loop(iters, draw, body, dev)
-        out = np.empty((R, len(Xt)), np.float64)
+        dev = next(flow.parameters()).device
+        cond = flow.cond
 
         with torch.no_grad():
-            # R x n x C is large
-            for start in range(0, len(Xt), 8192):
-                stop = min(start + 8192, len(Xt))
-                lp = torch.log_softmax(fwd(Xt[start:stop]), 2)
-                idx = gt[:, start:stop].unsqueeze(2)
-                out[:, start:stop] = lp.gather(2, idx).squeeze(2).cpu().numpy()
-
-        return out
-
-    def _class_logp(
-        self, Xin, g, rows_fit, rows_eval, n_cls, hid, iters, seed, wd=1e-4
-    ):
-        dev = next(self.flow_.parameters()).device
-        torch.manual_seed(seed)
-
-        net = torch.nn.Sequential(
-            torch.nn.Linear(Xin.shape[1], hid),
-            torch.nn.Tanh(),
-            torch.nn.Linear(hid, hid),
-            torch.nn.Tanh(),
-            torch.nn.Linear(hid, n_cls),
-        ).to(dev)
-
-        Xt = torch.as_tensor(np.asarray(Xin, np.float32), device=dev)
-        gt = torch.as_tensor(np.asarray(g, np.int64), device=dev)
-        opt = torch.optim.Adam(
-            net.parameters(), lr=1e-3, weight_decay=wd, capturable=dev.type == "cuda"
-        )
-        gen = torch.Generator(device=dev)
-        gen.manual_seed(seed)
-        fit_rows = torch.as_tensor(np.asarray(rows_fit, np.int64), device=dev)
-        bs = min(1024, len(rows_fit))
-        sel = torch.zeros(bs, dtype=torch.long, device=dev)
-        loss_fn = torch.nn.functional.cross_entropy
-
-        def draw():
-            sel.copy_(
-                fit_rows[
-                    torch.randint(0, len(fit_rows), (bs,), device=dev, generator=gen)
-                ]
+            xt = torch.as_tensor(xc, device=dev)
+            y_cell = flow.forward_main(xt)[:, :k]
+            lp_cell = cond.y_log_prob(y_cell).cpu().numpy()
+            gen = torch.Generator(device=dev)
+            gen.manual_seed(self._seed + 43)
+            w = torch.softmax(cond.ylogw, 0)
+            comp = torch.multinomial(w, 20000, replacement=True, generator=gen)
+            y_draw = cond.ymu[comp] + torch.exp(0.5 * cond.ylogvar[comp]) * torch.randn(
+                (20000, k), device=dev, generator=gen
             )
+            lp_draw = np.sort(cond.y_log_prob(y_draw).cpu().numpy())
 
-        def body():
-            loss = loss_fn(net(Xt[sel]), gt[sel])
-            opt.zero_grad(set_to_none=False)
-            loss.backward()
-            opt.step()
+        u = flow.fibre_ranks(xc, n_draws=n_draws, seed=self._seed)
+        below = np.searchsorted(lp_draw, lp_cell, side="left")
+        ties = np.searchsorted(lp_draw, lp_cell, side="right") - below
+        v = (below + rng.random(len(lp_cell)) * (ties + 1.0)) / (len(lp_draw) + 1.0)
 
-        graph_loop(iters, draw, body, dev)
-        eval_rows = torch.as_tensor(np.asarray(rows_eval, np.int64), device=dev)
-
-        with torch.no_grad():
-            lp = torch.log_softmax(net(Xt[eval_rows]), 1)
-
-            return (
-                lp[torch.arange(len(eval_rows), device=dev), gt[eval_rows]]
-                .cpu()
-                .numpy()
-            )
-
-    def hidden_contrast(
-        self,
-        G,
-        n_bins=14,
-        min_pts=16,
-        k_local=10,
-        hid=128,
-        iters=3000,
-        n_perm=99,
-        alpha=0.01,
-    ):
-        check_is_fitted(self)
-
-        Y = np.asarray(self.embedding_, np.float64)
-        n = len(Y)
-        g = np.asarray(G)
-        cls, g_idx = np.unique(g, return_inverse=True)
-
-        n_cls = len(cls)
-        if n_cls < 2:
-            raise ValueError("G must take at least two values")
-
-        rng = np.random.default_rng(self._seed + 17)
-        perm = rng.permutation(n)
-        fold_c, fold_a, fold_b = (
-            perm[: n // 3],
-            perm[n // 3 : 2 * n // 3],
-            perm[2 * n // 3 :],
-        )
-
-        lo, hi = Y.min(0), Y.max(0)
-        bin_ix = np.clip(
-            ((Y - lo) / (hi - lo + 1e-9) * n_bins).astype(int), 0, n_bins - 1
-        )
-        bin_id = bin_ix[:, 0] * n_bins + bin_ix[:, 1]
-        bins = [np.nonzero(bin_id == b)[0] for b in np.unique(bin_id)]
-
-        x_in = np.asarray(self._coords, np.float64)
-        tree_a = cKDTree(Y[fold_a])
-        _, nn_a = tree_a.query(Y, k=min(k_local, len(fold_a)))
-
-        # replica 0 is the real contrast, 1..n_perm are within-bin shuffles, and one batched
-        # pass per view fits them all, so the null costs little more than the signal
-        g_rn = np.empty((n_perm + 1, n), np.int64)
-        g_rn[0] = g_idx
-        for perm_i in range(n_perm):
-            g_perm = g_idx.copy()
-
-            # within bins the contrast dies, the marginal lives
-            for bin_rows in bins:
-                g_perm[bin_rows] = g_perm[rng.permutation(bin_rows)]
-
-            g_rn[perm_i + 1] = g_perm
-
-        lp_x = self._class_logp_batched(
-            x_in, g_rn, fold_c, n_cls, hid, iters, self._seed + 21
-        )
-        lp_y = self._class_logp_batched(
-            Y, g_rn, fold_c, n_cls, hid, iters, self._seed + 21
-        )
-        # (R, n) nats recoverable from x but not from y
-        gaps = lp_x - lp_y
-        gap, null_gaps = gaps[0], list(gaps[1:])
-        null_gap = np.mean(null_gaps, 0)
-
-        # the fold-A gap smoothed over screen position. Neither classifier saw A, so there
-        # is no in-sample optimism, and subtracting the null removes the capacity-mismatch bias
-        field = (gap - null_gap)[fold_a][nn_a].mean(1)
-        gap = gap - null_gap
-        null_level = [float(np.mean((ng - null_gap)[fold_b])) for ng in null_gaps]
-
-        # one permutation debiased by the others, so the figure's null is held out rather
-        # than a residual that is zero by construction
-        field_null = (
-            ((null_gaps[0] - np.mean(null_gaps[1:], 0))[fold_a][nn_a].mean(1))
-            if n_perm >= 2
-            else np.zeros_like(field)
-        )
-
-        # the certificate asks whether the fold-A field predicts fold-B's gap, per screen bin
-        bin_pairs = []
-        for b in np.unique(bin_id[fold_b]):
-            sel = fold_b[bin_id[fold_b] == b]
-            if len(sel) < min_pts:
-                continue
-
-            bin_pairs.append((float(field[sel].mean()), float(gap[sel].mean())))
-
-        if len(bin_pairs) < 3:
-            return field, dict(
-                passed=None, certifies="undecided", n_bins=len(bin_pairs)
-            )
-
-        pred, tgt = (
-            np.array([pair[0] for pair in bin_pairs]),
-            np.array([pair[1] for pair in bin_pairs]),
-        )
-
-        # linear, not log, the gap is a log-likelihood difference and can be negative
-        design = np.column_stack([pred, np.ones_like(pred)])
-        coef, *_ = np.linalg.lstsq(design, tgt, rcond=None)
-        r2 = float(
-            1
-            - ((tgt - design @ coef) ** 2).sum()
-            / max(((tgt - tgt.mean()) ** 2).sum(), 1e-12)
-        )
-        dyn_range = float(np.percentile(tgt, 95) - np.percentile(tgt, 5))
-        level = (
-            float(tgt.mean() / pred.mean()) if abs(pred.mean()) > 1e-9 else float("nan")
-        )
-        rng_b = np.random.default_rng(self._seed + 23)
-        n_pairs = len(pred)
-        slope_pass, r2_pass = [], []
-
-        for _ in range(2000):
-            boot_ix = rng_b.integers(0, n_pairs, n_pairs)
-            design_b = np.column_stack([pred[boot_ix], np.ones(n_pairs)])
-
-            try:
-                coef_b, *_ = np.linalg.lstsq(design_b, tgt[boot_ix], rcond=None)
-                r2_b = 1 - ((tgt[boot_ix] - design_b @ coef_b) ** 2).sum() / max(
-                    ((tgt[boot_ix] - tgt[boot_ix].mean()) ** 2).sum(), 1e-12
+        def band(r):
+            n = len(r)
+            srt = np.sort(r)
+            ks = float(
+                max(
+                    (np.arange(1, n + 1) / n - srt).max(),
+                    (srt - np.arange(n) / n).max(),
                 )
-            except np.linalg.LinAlgError:
-                continue
+            )
+            eps = float(np.sqrt(np.log(2.0 / alpha) / (2.0 * n)))
+            inside = int((r >= 0.1).sum())
+            lo = beta.ppf(alpha / 2, inside, n - inside + 1) if inside else 0.0
+            hi = beta.ppf(1 - alpha / 2, inside + 1, n - inside) if inside < n else 1.0
 
-            slope_pass.append(0.7 <= coef_b[0] <= 1.3)
-            r2_pass.append(r2_b >= 0.6)
+            if ks + eps <= margin:
+                passed, certifies = True, "certified"
+            elif ks - eps > margin:
+                passed, certifies = False, "refused"
+            else:
+                passed, certifies = None, "undecided"
 
-        # one-sided, asking whether the debiased signal clears its own permutation null
-        obs = float(np.mean(gap[fold_b]))
-        p_level = (1.0 + sum(lvl >= obs for lvl in null_level)) / (
-            1.0 + len(null_level)
+            return dict(
+                ks=ks,
+                band=eps,
+                cov90=inside / n,
+                cov90_ci=(float(lo), float(hi)),
+                passed=passed,
+                certifies=certifies,
+            )
+
+        # flags the map bins whose 90% fibre regions hold demonstrably fewer than 0.9 - margin
+        # of the held-out cells
+        Y = y_cell.cpu().numpy()
+        lo_y, hi_y = self._layout_bounds()
+        bix = np.clip(
+            ((Y - lo_y) / (hi_y - lo_y + 1e-9) * n_bins).astype(int), 0, n_bins - 1
         )
-
-        parts = {
-            "slope": float(np.mean(slope_pass)),
-            "r2": float(np.mean(r2_pass)),
-            "level": float(1.0 - p_level),
-        }
-
-        shape_ok = bool(0.7 <= coef[0] <= 1.3 and r2 >= 0.6)
-        passed = bool(shape_ok and p_level <= alpha)
-
-        return field, dict(
-            slope=float(coef[0]),
-            r2=r2,
-            level=level,
-            n_bins=n_pairs,
-            dynamic_range=dyn_range,
-            mean_gap=obs,
-            null_level=[round(lvl, 5) for lvl in null_level],
-            p_level=float(p_level),
-            n_perm=int(n_perm),
-            shape_ok=shape_ok,
-            field_null=field_null,
-            confidence=float(min(parts.values())),
-            confidence_parts=parts,
-            passed=passed,
-            certifies="magnitude+shape",
-        )
-
-    def spread_calibration(self, n_bins=14, min_pts=12, n_samples=64):
-        check_is_fitted(self)
-
-        if not self.density:
-            raise ValueError("density is off; refit with FloDR(density=True)")
-
-        n = len(self._coords)
-        rng = np.random.default_rng(self._seed)
-        perm = rng.permutation(n)
-
-        fold_a, fold_b = perm[: n // 2], perm[n // 2 :]
-        flow_a = copy.deepcopy(self.flow_)
-        flow_a._density_args = None
-        flow_a.fit_cond_tail_cv(self._coords[fold_a], seed=self._seed)
-
-        mu, sigma = viz.conditional_moments(
-            flow_a,
-            self.embedding_[fold_b],
-            to_input=self._to_raw,
-            n_samples=n_samples,
-            seed=self._seed,
-        )
-
-        sigma2 = sigma**2
-        X = self._to_raw(self._coords)
-        Y = self.embedding_
-        lo, hi = Y.min(0), Y.max(0)
-
-        bin_ix = np.clip(
-            ((Y[fold_b] - lo) / (hi - lo + 1e-9) * n_bins).astype(int), 0, n_bins - 1
-        )
-
-        bin_id = bin_ix[:, 0] * n_bins + bin_ix[:, 1]
-        emp_var, mod_var = [], []
+        bin_id = bix[:, 0] * n_bins + bix[:, 1]
+        regions, flagged = [], []
 
         for b in np.unique(bin_id):
             sel = bin_id == b
+            n_b = int(sel.sum())
 
-            if sel.sum() < min_pts:
+            if n_b < min_pts:
                 continue
 
-            x_bin = X[fold_b][sel].astype(np.float64)
-            emp_var.append(((x_bin - x_bin.mean(0)) ** 2).sum(1).mean())
-
-            # without the Var(mu) term, bin smearing biases the slope up
-            mu_bin = mu[sel].astype(np.float64)
-            mod_var.append(
-                float(
-                    sigma2[sel].mean() + ((mu_bin - mu_bin.mean(0)) ** 2).sum(1).mean()
-                )
+            inside = int((u[sel] >= 0.1).sum())
+            hi = (
+                beta.ppf(1 - alpha / 2, inside + 1, n_b - inside)
+                if inside < n_b
+                else 1.0
+            )
+            regions.append(
+                dict(bin=int(b), n=n_b, cov90=inside / n_b, cov90_hi=float(hi))
             )
 
-        emp_var, mod_var = np.array(emp_var), np.array(mod_var)
+            if hi < 0.9 - margin:
+                flagged.append(int(b))
 
-        # in log space, because bin variances span decades and the top bins would dominate
-        log_emp, log_mod = (
-            np.log(np.maximum(emp_var, 1e-12)),
-            np.log(np.maximum(mod_var, 1e-12)),
-        )
+        fibre, dmap = band(u), band(v)
+        both = (fibre["passed"], dmap["passed"])
 
-        design = np.column_stack([log_mod, np.ones_like(log_mod)])
-        coef, *_ = np.linalg.lstsq(design, log_emp, rcond=None)
-
-        r2 = float(
-            1
-            - ((log_emp - design @ coef) ** 2).sum()
-            / ((log_emp - log_emp.mean()) ** 2).sum()
-        )
-
-        ratio = mod_var / np.maximum(emp_var, 1e-12)
-
-        dyn_range = float(
-            np.percentile(emp_var, 95) / max(np.percentile(emp_var, 5), 1e-12)
-        )
-
-        # gated separately from the shape, because the log intercept absorbs a constant bias
-        level_ok = bool(0.5 <= np.median(ratio) <= 2.0)
-
-        passed = level_ok and (dyn_range < 3.0 or (0.7 <= coef[0] <= 1.3 and r2 >= 0.6))
-
-        # intersection-union bootstrap over bins, so scarce data reads as low confidence
-        # rather than as measured miscalibration
-        rng_b = np.random.default_rng(self._seed + 7)
-        n_pairs = len(emp_var)
-        slope_pass, r2_pass, level_pass = [], [], []
-
-        for _ in range(2000):
-            boot_ix = rng_b.integers(0, n_pairs, n_pairs)
-            le_b, lm_b, ratio_b = log_emp[boot_ix], log_mod[boot_ix], ratio[boot_ix]
-            design_b = np.column_stack([lm_b, np.ones_like(lm_b)])
-
-            try:
-                coef_b, *_ = np.linalg.lstsq(design_b, le_b, rcond=None)
-                r2_b = 1 - ((le_b - design_b @ coef_b) ** 2).sum() / max(
-                    ((le_b - le_b.mean()) ** 2).sum(), 1e-12
-                )
-            except np.linalg.LinAlgError:
-                continue
-
-            slope_pass.append(0.7 <= coef_b[0] <= 1.3)
-            r2_pass.append(r2_b >= 0.6)
-            level_pass.append(0.5 <= np.median(ratio_b) <= 2.0)
-
-        conf_parts = {"level": float(np.mean(level_pass))}
-
-        if dyn_range >= 3.0:
-            conf_parts["slope"] = float(np.mean(slope_pass))
-            conf_parts["r2"] = float(np.mean(r2_pass))
-
-        confidence = float(min(conf_parts.values()))
+        # the share of cells less likely than every draw, with its one-sided Clopper-Pearson
+        # bound and the nominal 1 / (M + 1); reported, not part of the verdict
+        def tail(r, m):
+            n, k_out = len(r), int((r < 1.0 / (m + 1)).sum())
+            hi = beta.ppf(1 - alpha, k_out + 1, n - k_out) if k_out < n else 1.0
+            return dict(share=k_out / n, upper=float(hi), nominal=1.0 / (m + 1), n=n)
 
         return dict(
-            slope=float(coef[0]),
-            r2=r2,
-            ratio_quartiles=tuple(np.percentile(ratio, [25, 50, 75]).round(3)),
-            dynamic_range=dyn_range,
-            n_bins=len(emp_var),
-            passed=passed,
-            confidence=confidence,
-            confidence_parts=conf_parts,
-            certifies="magnitude+shape" if dyn_range >= 3.0 else "magnitude-only",
+            fibre=dict(ranks=u, **fibre),
+            map=dict(ranks=v, **dmap),
+            tail=dict(fibre=tail(u, n_draws), map=tail(v, len(lp_draw))),
+            regions=regions,
+            flagged=flagged,
+            bin_id=bin_id,
+            positions=Y,
+            passed=False if False in both else (None if None in both else True),
+            certifies=(
+                "certified"
+                if both == (True, True)
+                else ("refused" if False in both else "undecided")
+            ),
+            margin=margin,
+            n_cells=len(u),
+            n_draws=n_draws,
+            held_out="tail refitted on half the cells" if X is None else "new cells",
+        )
+
+    # ranks held-out cells by input distance to the draws, which also catches draws that are too
+    # wide in input space
+    def energy_certificate(
+        self, X, n_draws=199, margin=0.1, alpha=0.05, precision_margin=0.02
+    ):
+        check_is_fitted(self)
+        self._need_density()
+        X = validate_data(self, X, dtype=np.float32, reset=False)
+
+        return fidelity.energy_certificate(
+            self, X, n_draws, margin, alpha, precision_margin
+        )
+
+    # where the decode is near-linear at the density's input noise
+    def faithful_scale(
+        self, X=None, h=(0.125, 0.25, 0.5, 1.0, 2.0), n_steps=4, threshold=0.25
+    ):
+        check_is_fitted(self)
+        sd = self._density_sd()
+
+        if sd is None:
+            raise ValueError(
+                "faithful_scale steps at the density's input noise, which this model does not "
+                "have (density=False, density_noise=0 or a binary input)"
+            )
+
+        if X is None:
+            Z = self._coords
+        else:
+            X = validate_data(self, X, dtype=np.float32, reset=False)
+            Z = self._to_coords(X)
+
+        return fidelity.faithful_scale(
+            self, Z, sd, h, int(n_steps), threshold, self._seed + 61
         )

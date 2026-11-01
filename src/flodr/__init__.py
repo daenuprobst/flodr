@@ -1,3 +1,4 @@
+from .audit import AuditResult, audit, plot_audit
 from .data import (
     find_ab,
     fuzzy_knn_graph,
@@ -20,6 +21,9 @@ from . import viz
 
 __all__ = [
     "FloDR",
+    "audit",
+    "plot_audit",
+    "AuditResult",
     "Flow",
     "Coupling",
     "TrainConfig",

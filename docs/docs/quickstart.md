@@ -1,45 +1,35 @@
 ---
 title: Quickstart
-sidebar_position: 3
 ---
 
-# Quickstart
-
-This fits FloDR to a matrix with one row per point, then uses each part of the fitted model once.
-
 ```python
+import matplotlib.pyplot as plt
 import numpy as np
-from flodr import FloDR, viz
+from flodr import FloDR, audit, viz
 
-rng = np.random.default_rng(0)
-X = rng.normal(size=(5000, 50)).astype("float32")
-labels = (X[:, 0] > 0).astype(int)
+# X: one row per point, e.g. 50 standardised principal components; labels: one per row
+train, test = np.arange(len(X)) % 5 != 0, np.arange(len(X)) % 5 == 0
 
-model = FloDR(random_state=0).fit(X)
-Y = model.embedding_                        # (5000, 2) layout
+model = FloDR(random_state=0).fit(X[train])
+Y = model.embedding_                              # the map of the training points
 
-Y_new = model.transform(X[:100])            # one pass through the flow
-Y_opt = model.transform_opt(X[:100])        # placement refined against the training layout
+Y_new = model.transform(X[test])                  # one pass through the flow
+Y_opt = model.transform_opt(X[test])              # optimised against the training map
+X_back = model.inverse_transform(Y[:10])          # positions back to the input
+Z = model.transform_latent(X[test])               # the map, then the residual
+X_same = model.inverse_latent(Z)                  # exact up to float precision
 
-Z = model.transform_latent(X[:100])         # layout followed by the residual
-X_back = model.inverse_latent(Z)            # equal to X[:100] up to float precision
-X_rep = model.inverse_transform(Y[:100])    # one representative input per position
+logp = model.score_samples(X[test])               # log density
+cert = model.coverage_certificate(X[test])        # is the density a law of new points?
+print(cert["certifies"])                          # "certified", "refused" or "undecided"
 
-logp = model.score_samples(X[:100])         # log density of each point
+res = audit(Y, X=X[train], labels=labels[train])  # what the map hides about the labels
+print(res)
 
-sigma = model.conditional_spread()          # spread of the inputs behind each position
-cert = model.spread_calibration()           # held-out test of that field
-field, hidden = model.hidden_contrast(labels)
-
-ax = viz.plot_embedding(Y, labels)
-viz.save(ax.figure, "embedding.png")
+fig, ax = plt.subplots(1, 2, figsize=(8, 4))
+viz.plot_embedding(Y, labels[train], ax=ax[0])
+viz.plot_ranks([cert["fibre"]["ranks"], cert["map"]["ranks"]], ax=ax[1])
+viz.save(fig, "flodr.pdf")
 ```
 
-A fit of 5,000 points takes about two minutes on a consumer GPU. `hidden_contrast` trains a classifier for
-every permutation of its null and is the slowest call here.
-
-## Next
-
-The layout depends on the input more than on any parameter, so read [Choosing the input](guide/inputs.md) before
-fitting your own data. [Fitting](guide/fitting.md) explains the parameters, and
-[Diagnostics](guide/diagnostics.md) explains how to read the fields and their tests.
+Fitting uses the GPU when PyTorch sees one. `examples/quickstart.ipynb` runs these calls on Fashion-MNIST.
