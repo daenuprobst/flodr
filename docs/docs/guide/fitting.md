@@ -11,6 +11,12 @@ the 15 nearest neighbours and trains the flow so that the first coordinates keep
 the order of distances between points, weighted by `w`. With `density=True` the density of the residual is fitted
 after the layout.
 
+![The same paul15 cells fitted with w = 0, the default and axes="heat"](../images/paul15_maps.png)
+
+2,184 bone marrow cells ([paul15](../examples/paul15.md)) fitted with `w=0`, the default and `axes="heat"`. At the
+same recall@15 (0.27) the distance order lifts CPD, the rank correlation of input and map distances, from 0.56 to
+0.80.
+
 ## Parameters
 
 | Parameter | Default | |

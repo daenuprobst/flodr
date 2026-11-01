@@ -39,6 +39,7 @@ export default defineConfig({
 						'guide/scikit-learn',
 					],
 				},
+				{ label: 'Examples', items: ['examples/fashion-mnist', 'examples/paul15', 'examples/benchmark'] },
 				{ label: 'API', items: ['api/flodr', 'api/viz', 'api/training'] },
 			],
 		}),

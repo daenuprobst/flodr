@@ -1,8 +1,10 @@
 # FloDR
 
+**[Documentation](https://daenuprobst.github.io/flodr/)**
+
 Dimensionality reduction built on an invertible normalising flow. The first `n_components` coordinates of the flow
 are the map and the rest are a residual, so the fitted map has an exact inverse and an exact density. FloDR follows
-the scikit-learn estimator interface, like UMAP. The documentation is at https://daenuprobst.github.io/flodr/.
+the scikit-learn estimator interface, like UMAP.
 
 ![](assets/flow_morph_bmarrow_white.gif)
 

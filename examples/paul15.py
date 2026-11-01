@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import scanpy as sc
 from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 from scipy.spatial import cKDTree
 from scipy.spatial.distance import pdist
 from scipy.stats import spearmanr
@@ -20,7 +21,9 @@ PATHS = [
     ([("9GMP", "10GMP"), ("16Neu", "17Neu")], ["Mpo", "Elane"]),
 ]
 
-# log expression of the 1,000 most variable genes and its 50 principal components
+# log expression of the 1,000 most variable genes and its 50 principal components,
+# unscaled: on 2,730 cells the trailing ones are mostly noise, and standardising would
+# weigh them like the leading ones
 adata = sc.datasets.paul15()
 clusters = np.asarray(adata.obs["paul15_clusters"]).astype(str)
 types = np.char.lstrip(clusters, "0123456789")
@@ -60,7 +63,8 @@ fits = {
     'w = 2, axes="heat"': dict(axes="heat"),
 }
 models = {}
-fig, axes = plt.subplots(1, 3, figsize=(13, 4.8))
+fig, axes = plt.subplots(1, 3, figsize=(9, 3.3))
+fig.subplots_adjust(left=0.02, right=0.98, top=0.92, bottom=0.07, wspace=0.08)
 for ax, (name, kw) in zip(axes, fits.items()):
     m = models[name] = FloDR(random_state=0, verbose=False, **kw).fit(X[train])
     recall, cpd = scores(X[train], m.embedding_)
@@ -71,8 +75,13 @@ for ax, (name, kw) in zip(axes, fits.items()):
 handles = [
     Line2D([], [], ls="", marker="o", ms=5, c=c, label=t) for t, c in pal.items()
 ]
-fig.legend(handles=handles, loc="lower center", ncol=10, frameon=False)
-fig.subplots_adjust(bottom=0.12)
+fig.legend(
+    handles=handles,
+    loc="upper center",
+    bbox_to_anchor=(0.5, 0.07),
+    ncol=10,
+    frameon=False,
+)
 viz.save(fig, OUT / "paul15_maps.png", dpi=200)
 model = models["w = 2 (default)"]
 Y = model.embedding_
@@ -102,7 +111,7 @@ ends = [
     (("GMP", pal["GMP"]), ("Neu", pal["Neu"])),
 ]
 on = np.isin(types[train], ["MEP", "Ery", "GMP", "Neu"])
-fig = plt.figure(figsize=(12, 5))
+fig = plt.figure(figsize=(9, 3.9))
 gs = fig.add_gridspec(1, 2, width_ratios=(1, 1.4), wspace=0.15)
 viz.plot_paths(Y, paths, types[train], pal, ends, far, on, fig.add_subplot(gs[0]))
 bands = gs[1].subgridspec(2, 2, hspace=0.35, wspace=0.25)
@@ -116,6 +125,16 @@ for p, (path, (_, names)) in enumerate(zip(paths, PATHS)):
         lo, hi = band["lo"][:, g], band["hi"][:, g]
         viz.plot_band(lo, hi, draws[:, g], near[:, g], far[p], name, ax)
         ax.set_xticklabels([ends[p][0][0], ends[p][1][0]])
+key = [
+    Patch(color="#DCD3DC", label="90% conformal band"),
+    Line2D([], [], c="#AA4499", label="mean of 256 exact draws"),
+    Line2D(
+        [], [], ls="", marker="_", c="#2E8B7A", label="mean of the 30 nearest cells"
+    ),
+]
+fig.legend(
+    handles=key, loc="upper center", bbox_to_anchor=(0.66, 0.02), ncol=3, frameon=False
+)
 viz.save(fig, OUT / "paul15_paths.png", dpi=200)
 
 # the coverage certificate on the held-out cells
@@ -126,10 +145,19 @@ ranks = [cert["fibre"]["ranks"], cert["map"]["ranks"]]
 viz.plot_ranks(ranks, ax=ax, colours=["#c25e08", "#4477AA"])
 ax.legend(ax.lines[-2:], ["fibre", "map"], frameon=False, loc="upper left")
 ax.set(ylabel="fraction of cells", title=f"{len(test)} held-out cells")
-viz.save(fig, OUT / "paul15_certificate.png", dpi=200)
+viz.save(fig, OUT / "paul15_certificate.png", dpi=130)
 
-# what the map hides about the cell type
-res = audit(Y, X=X[train], labels=types[train], seed=0, verbose=False)
-print(res)
-axes = viz.plot_audit(res, size=4.5)
-viz.save(axes[0].figure, OUT / "paul15_audit.png", dpi=200)
+# what a map hides about the cell type, for this map and for the first two principal
+# components, on one colour scale
+maps = {"FloDR": Y, "PCA": X[train][:, :2]}
+res = {
+    k: audit(v, X=X[train], labels=types[train], seed=0, verbose=False)
+    for k, v in maps.items()
+}
+top = max(np.quantile(np.clip(r.lower, 0, None), 0.99) for r in res.values())
+fig, axes = plt.subplots(1, 2, figsize=(8, 3.7))
+for ax, (name, r) in zip(axes, res.items()):
+    print(name, r)
+    viz.plot_audit(r, axes=[ax], show_labels=False, vmax=max(top, 0.05))
+    ax.set_title(f"{name}\n{ax.get_title()}", fontsize=10)
+viz.save(fig, OUT / "paul15_audit.png", dpi=200)
