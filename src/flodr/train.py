@@ -655,8 +655,8 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
     # the compiled steps are closures redefined every fit, so their cache entries pile
     # up on one code object; the fifth fit on new shapes then hits the recompile limit,
     # an error under fullgraph
-    # ponytail: clears every compiled function in the process, evict per code object if
-    # users mix FloDR with their own torch.compile models
+    # this clears every compiled function in the process; evicting per code object would
+    # spare users' own torch.compile models
     if dev.type == "cuda" or cfg.cpu_compile:
         torch.compiler.reset()
 
@@ -1043,8 +1043,8 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
             d2_e = d2_edge.float()
             # the batch's edges at their current length, every other edge as last seen
             L_dens = -(log_radius(d2_buf.index_put((edge_idx,), d2_e)) @ ro)
-            # ponytail: a skipped over-cap batch still writes lengths between wrong
-            # cells; they are finite and redrawn within a few steps
+            # a skipped over-cap batch still writes lengths between wrong cells; they
+            # are finite and redrawn within a few steps
             d2_buf.index_put_((edge_idx,), d2_e.detach())
         else:
             L_dens = 0.0
