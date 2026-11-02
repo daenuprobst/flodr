@@ -252,6 +252,51 @@ def test_input_checks():
     assert list(m.get_feature_names_out()) == ["flodr0", "flodr1"]
 
 
+# views such as X[:, ::-1] (scanpy's PCA returns one) reached torch.from_numpy and failed
+def test_negative_strides():
+    X, _ = blobs(200, 12)
+    Xr = np.ascontiguousarray(X[:, ::-1])
+    m = short().fit(X[:, ::-1])
+    np.testing.assert_array_equal(m.transform(X[:20, ::-1]), m.transform(Xr[:20]))
+    m.inverse_transform(m.embedding_[::-1])
+    Z = m.transform_latent(Xr[:20])
+    np.testing.assert_allclose(m.inverse_latent(Z[::-1]), Xr[19::-1], atol=1e-3)
+    assert np.isfinite(m.score_samples(X[:20, ::-1])).all()
+
+
+# each fit on new shapes adds compiled entries; the fifth used to exceed dynamo's recompile limit
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no GPU")
+def test_many_fits_one_process():
+    for d in range(12, 30, 3):
+        FloDR(random_state=0, max_iter=ITERS, verbose=False).fit(blobs(200, d)[0])
+
+
+# the density term lifts the correlation of input and map neighbour radii, in the full-batch
+# step and in the edge-batched one, which keeps every edge's last length
+@pytest.mark.parametrize("edge_batch", [0, 512], ids=["full", "batched"])
+def test_density_term(edge_batch):
+    from sklearn.neighbors import NearestNeighbors
+
+    rng = np.random.default_rng(0)
+    lab = rng.integers(0, 4, 400)
+    spread = np.array([0.3, 1.0, 2.0, 4.0])[lab, None]
+    X = rng.normal(size=(4, 20))[lab] * 8 + rng.normal(size=(400, 20)) * spread
+    X = X.astype(np.float32)
+
+    def radius_corr(w_dens):
+        adv = {"w_dens": w_dens, "edge_batch": edge_batch}
+        Y = short(advanced=adv).fit_transform(X)
+        r = [
+            np.log(
+                NearestNeighbors(n_neighbors=16).fit(Z).kneighbors(Z)[0][:, 1:].mean(1)
+            )
+            for Z in (X, Y)
+        ]
+        return np.corrcoef(*r)[0, 1]
+
+    assert radius_corr(2.0) > radius_corr(0.0) + 0.1
+
+
 def test_three_components():
     X, _ = blobs(300, 20)
     m = short(n_components=3).fit(X)

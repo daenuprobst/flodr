@@ -38,6 +38,14 @@ principal components or an integrated latent such as scVI, unscaled. Binary inpu
 distances. Inputs with fewer than 30 columns are padded with noise columns to 30; new points get zeros there.
 Reduce inputs with thousands of columns first.
 
+## Density preservation
+
+`advanced={"w_dens": 2.0}` adds the density term of densMAP: each point's mean distance to its neighbours on the map
+follows the same quantity in the input, so dense populations stay compact and diffuse ones spread out. It is off by
+default because it trades local structure for density. On the human fetal bone marrow atlas at weight 2 the
+correlation of input and map radii rises from 0.08 to 0.67 and recall@15 falls from 0.200 to 0.151; 0.5 is a milder
+setting (0.62 and 0.180).
+
 ## Reproducibility
 
 On the CPU a seed reproduces a fit exactly. On CUDA the compiled half-precision training step is about twice as fast

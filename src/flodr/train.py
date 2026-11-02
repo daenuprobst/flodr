@@ -471,6 +471,9 @@ class TrainConfig:
     # mid-near attraction
     w_global: float = 0.6
     w_stress: float = 0.0
+    # densMAP's density term: the correlation of each cell's log neighbour radius, input
+    # vs layout; trades local recall for density preservation, so off by default
+    w_dens: float = 0.0
     # 1 = ordinal hinge on ranks, 0 = log-ratio stress
     stress_ordinal: int = 1
     # "euclid" | "jaccard" (needs stress_X in {0, 1})
@@ -648,6 +651,15 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
 
     torch.manual_seed(cfg.seed)
     dev = torch.device(cfg.device)
+
+    # the compiled steps are closures redefined every fit, so their cache entries pile
+    # up on one code object; the fifth fit on new shapes then hits the recompile limit,
+    # an error under fullgraph
+    # ponytail: clears every compiled function in the process, evict per code object if
+    # users mix FloDR with their own torch.compile models
+    if dev.type == "cuda" or cfg.cpu_compile:
+        torch.compiler.reset()
+
     # output kernel 1 / (1 + a d^(2b))
     a, b = find_ab(cfg.min_dist)
     x_t = torch.from_numpy(Xp).float().to(dev)
@@ -773,6 +785,31 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
             ((x_stress[row_a] - x_stress[row_b]) ** 2).sum(1).clamp_min(1e-12)
         )
 
+    if cfg.w_dens:
+        w_e = (
+            w_attr
+            if w_attr is not None
+            else torch.ones_like(edge_i, dtype=torch.float32)
+        )
+        mu = (
+            torch.zeros(n, device=dev)
+            .index_add(0, edge_i, w_e)
+            .index_add(0, edge_j, w_e)
+        )
+
+        # densMAP's local radius, the weighted mean squared edge length, as a unit
+        # vector of centred logs, so a dot product of two is their correlation
+        def log_radius(d2):
+            r = torch.zeros(n, device=dev).index_add(0, edge_i, w_e * d2)
+            r = r.index_add(0, edge_j, w_e * d2)
+            r = torch.log(1e-8 + r / mu.clamp_min(1e-12))
+            r = r - r.mean()
+
+            return r / r.norm().clamp_min(1e-12)
+
+        # in the input's own metric
+        ro = log_radius(torch.exp(2 * _lh(edge_i, edge_j)))
+
     aux_n = n if cfg.aux_batch <= 0 else min(cfg.aux_batch, n)
 
     def step(
@@ -855,12 +892,14 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
             L_recon = 0.0
 
         L_nll = -(flow.base_log_prob(z_sub) + logdet_s).mean() / D if cfg.w_nll else 0.0
+        L_dens = -(log_radius(d2_edge) @ ro) if cfg.w_dens else 0.0
 
         return L_local + ramp * (
             cfg.w_recon * L_recon
             + cfg.w_global * L_glob
             + cfg.w_nll * L_nll
             + cfg.w_stress * L_stress
+            + cfg.w_dens * L_dens
         )
 
     # a step's draws, outside the loss, so a compiled loss sees the eager indices
@@ -912,6 +951,7 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
             mdist_a,
             mdist_b,
             rows,
+            edge_idx,
         )
 
     def loss_edge_batch(
@@ -931,6 +971,7 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
         mdist_a,
         mdist_b,
         rows,
+        edge_idx,
         keep,
         ramp,
     ):
@@ -998,6 +1039,16 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
 
         L_nll = -(flow.base_log_prob(z_sub) + logdet_s).mean() / D if cfg.w_nll else 0.0
 
+        if cfg.w_dens:
+            d2_e = d2_edge.float()
+            # the batch's edges at their current length, every other edge as last seen
+            L_dens = -(log_radius(d2_buf.index_put((edge_idx,), d2_e)) @ ro)
+            # ponytail: a skipped over-cap batch still writes lengths between wrong
+            # cells; they are finite and redrawn within a few steps
+            d2_buf.index_put_((edge_idx,), d2_e.detach())
+        else:
+            L_dens = 0.0
+
         return (
             L_attr
             + cfg.w_rep * L_rep
@@ -1007,6 +1058,7 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
                 + cfg.w_global * L_glob
                 + cfg.w_nll * L_nll
                 + cfg.w_stress * L_stress
+                + cfg.w_dens * L_dens
             )
         )
 
@@ -1028,6 +1080,21 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
         eb_size = EDGE_BATCH_CAP if n_edges > EDGE_BATCH_CAP else 0
     else:
         eb_size = min(cfg.edge_batch, n_edges) if cfg.edge_batch else 0
+
+    # a batch holds a few edges, so each cell's radius takes every other edge's last
+    # length
+    d2_buf = None
+
+    if cfg.w_dens and eb_size:
+        with torch.no_grad():
+            Y0 = torch.cat(
+                [
+                    flow.forward_with_logdet(x_t[s : s + 8192])[0][:, :k]
+                    for s in range(0, n, 8192)
+                ]
+            )
+
+        d2_buf = ((Y0[edge_i] - Y0[edge_j]) ** 2).sum(1).float()
 
     graphs = _graphs_on(cfg, dev, flow, lin_on)
     step_mode = "graph" if graphs else "eager"
@@ -1157,6 +1224,7 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
                     mdist_a,
                     mdist_b,
                     pick(rows),
+                    edge_idx,
                     keep,
                     ramp,
                 )

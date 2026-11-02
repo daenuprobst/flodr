@@ -238,7 +238,12 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
     def fit(self, X, y=None):
         self._check_params(self.max_iter)
         X = validate_data(
-            self, X, dtype=np.float32, ensure_min_samples=2, ensure_min_features=2
+            self,
+            X,
+            dtype=np.float32,
+            order="C",
+            ensure_min_samples=2,
+            ensure_min_features=2,
         )
         self._seed = self._seed_from()
         self._device = default_device() if self.device is None else self.device
@@ -421,13 +426,13 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
 
     def transform(self, X):
         check_is_fitted(self)
-        X = validate_data(self, X, dtype=np.float32, reset=False)
+        X = validate_data(self, X, dtype=np.float32, order="C", reset=False)
 
         return self._forward(X)[:, : self.n_components].cpu().numpy()
 
     def transform_opt(self, X, steps=200, lr=0.05):
         check_is_fitted(self)
-        X = validate_data(self, X, dtype=np.float32, reset=False)
+        X = validate_data(self, X, dtype=np.float32, order="C", reset=False)
         _, nn = knn_query(self._X, X, self._k, self._metric)
         a, b = find_ab(self._cfg.min_dist)
         dev = next(self.flow_.parameters()).device
@@ -453,14 +458,14 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
     # the full latent, layout first and then the residual; inverse_latent undoes it exactly
     def transform_latent(self, X):
         check_is_fitted(self)
-        X = validate_data(self, X, dtype=np.float32, reset=False)
+        X = validate_data(self, X, dtype=np.float32, order="C", reset=False)
 
         return self._forward(X).cpu().numpy()
 
     # decodes [y, 0]: the residual set to zero
     def inverse_transform(self, Y):
         check_is_fitted(self)
-        Y = check_array(Y, dtype=np.float32)
+        Y = check_array(Y, dtype=np.float32, order="C")
 
         if Y.shape[1] != self.n_components:
             raise ValueError(
@@ -480,7 +485,7 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
         if isinstance(Z, torch.Tensor):
             Z = Z.detach().cpu().numpy()
 
-        Z = check_array(Z, dtype=np.float32)
+        Z = check_array(Z, dtype=np.float32, order="C")
 
         if Z.shape[1] != self.flow_.d:
             raise ValueError(
@@ -497,7 +502,7 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
     @available_if(_has_density)
     def score_samples(self, X):
         check_is_fitted(self)
-        X = validate_data(self, X, dtype=np.float32, reset=False)
+        X = validate_data(self, X, dtype=np.float32, order="C", reset=False)
         self._need_density()
 
         # log_prob runs the flow itself, so it takes the whitened coordinates
@@ -597,7 +602,7 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
             )
             xc = np.asarray(self._coords[fold_b], np.float32)
         else:
-            X = validate_data(self, X, dtype=np.float32, reset=False)
+            X = validate_data(self, X, dtype=np.float32, order="C", reset=False)
             flow, xc = self.flow_, np.asarray(self._to_coords(X), np.float32)
 
         xc = self._noised(xc)
@@ -720,7 +725,7 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
     ):
         check_is_fitted(self)
         self._need_density()
-        X = validate_data(self, X, dtype=np.float32, reset=False)
+        X = validate_data(self, X, dtype=np.float32, order="C", reset=False)
 
         return fidelity.energy_certificate(
             self, X, n_draws, margin, alpha, precision_margin
@@ -742,7 +747,7 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
         if X is None:
             Z = self._coords
         else:
-            X = validate_data(self, X, dtype=np.float32, reset=False)
+            X = validate_data(self, X, dtype=np.float32, order="C", reset=False)
             Z = self._to_coords(X)
 
         return fidelity.faithful_scale(
