@@ -1,6 +1,6 @@
 [project]
 name = "flodr"
-version = "0.2.0"
+version = "0.2.1"
 description = "FloDR: exactly invertible dimensionality reduction built on a normalizing flow"
 readme = "README.md"
 requires-python = ">=3.11"
