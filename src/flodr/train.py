@@ -776,10 +776,12 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
             raise ValueError("stress_metric='jaccard' needs binary stress_X")
 
         row_sums = x_stress.sum(1)
+        # as bytes: the intersection is the same count, read from a quarter of the memory
+        x_stress = x_stress.to(torch.uint8)
 
     def _lh(row_a, row_b):
         if cfg.stress_metric == "jaccard":
-            inter = (x_stress[row_a] * x_stress[row_b]).sum(1)
+            inter = (x_stress[row_a] & x_stress[row_b]).sum(1)
             union = (row_sums[row_a] + row_sums[row_b] - inter).clamp_min(1.0)
             return torch.log((1.0 - inter / union).clamp_min(1e-6))
 
