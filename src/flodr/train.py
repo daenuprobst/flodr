@@ -455,6 +455,8 @@ class _StepGraphs:
 
 # largest edge batch for edge_batch=-1, below it the graph is taken whole
 EDGE_BATCH_CAP = 262_144
+# a coupling skips the outputs it does not read from this many of them per step
+SLIM_FROM = 2**21
 
 
 @dataclass
@@ -1080,6 +1082,14 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
         eb_size = EDGE_BATCH_CAP if n_edges > EDGE_BATCH_CAP else 0
     else:
         eb_size = min(cfg.edge_batch, n_edges) if cfg.edge_batch else 0
+
+    # on the GPU a coupling computes only the outputs it reads once enough are skipped
+    if dev.type == "cuda":
+        pts = min(n, 2 * eb_size) if eb_size else n
+
+        for layer in flow.layers:
+            unread = 2 * int(layer.mask.sum())
+            layer.slim_head(pts * unread >= SLIM_FROM)
 
     # a batch holds a few edges, so each cell's radius takes every other edge's last
     # length

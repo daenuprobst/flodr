@@ -93,16 +93,24 @@ def _few_threads(fn):
     return wrapped
 
 
-def _mlp(net, x):
-    # under autocast the output layer stays fp32: it writes the layout, and bf16 rounds
-    # that coarser than the 1-NN spacing
-    if not (Coupling.fp32_head and torch.is_autocast_enabled(x.device.type)):
-        return net(x)
+def _mlp(net, x, rows=None):
+    # rows: the outputs a coupling reads; the others would be multiplied by zero, so
+    # they are not computed, and their weights keep a zero gradient as before
+    last = net[-1]
+    w, b = last.weight, last.bias
+
+    if rows is not None:
+        w, b = w[rows], b[rows]
 
     h = net[:-1](x)
 
+    # under autocast the output layer stays fp32: it writes the layout, and bf16 rounds
+    # that coarser than the 1-NN spacing
+    if not (Coupling.fp32_head and torch.is_autocast_enabled(x.device.type)):
+        return torch.nn.functional.linear(h, w, b)
+
     with torch.autocast(x.device.type, enabled=False):
-        return net[-1](h.float())
+        return torch.nn.functional.linear(h.float(), w, b)
 
 
 class Coupling(torch.nn.Module):
@@ -161,11 +169,31 @@ class Coupling(torch.nn.Module):
             self.net[-1].weight.mul_(0.0)
             self.net[-1].bias.mul_(0.0)
 
+    # set by slim_head
+    slim = False
+
+    def slim_head(self, on):
+        # compute only the outputs that are read: the dims this coupling writes, and
+        # their rows of the head (scales, then shifts). The values are the same; on the
+        # GPU the gathers cost more than they save on small batches, so train_flodr
+        # decides
+        if on and "free_idx" not in self._buffers:
+            free = torch.nonzero(self.mask == 0).squeeze(1)
+            self.register_buffer("free_idx", free, persistent=False)
+            rows = torch.cat([free, self.mask.shape[0] + free])
+            self.register_buffer("head_rows", rows, persistent=False)
+
+        self.slim = bool(on)
+
     def _st(self, xm):
-        free = 1 - self.mask
         inp = xm @ self.S.T if self.S is not None else xm
-        net = self.net
-        head = _mlp(net, inp) if isinstance(net, torch.nn.Sequential) else net(inp)
+        net, rows = self.net, self.head_rows if self.slim else None
+
+        if isinstance(net, torch.nn.Sequential):
+            head = _mlp(net, inp, rows)
+        else:
+            head = net(inp, rows)
+
         s_raw, t_raw = head.chunk(2, dim=1)
 
         if self.gate_max <= 0:
@@ -174,25 +202,43 @@ class Coupling(torch.nn.Module):
             bound = self.gate_max if self.gmax_vec is None else self.gmax_vec
             gate = bound * torch.tanh(self.gate)
 
-        return gate * torch.tanh(s_raw) * free, t_raw * free
+        if not self.slim:
+            free = 1 - self.mask
+            return gate * torch.tanh(s_raw) * free, t_raw * free
+
+        if gate.shape[0] > 1:
+            gate = gate[self.free_idx]
+
+        return gate * torch.tanh(s_raw), t_raw
+
+    def _write(self, x, x_masked, new):
+        # new holds every dim, or only the written ones under slim
+        if not self.slim:
+            return x_masked + (1 - self.mask) * new
+
+        return x.index_copy(1, self.free_idx, new.to(x.dtype))
+
+    def _read(self, x):
+        return x[:, self.free_idx] if self.slim else x
 
     def forward(self, x):
         x_masked = x * self.mask
         scale, shift = self._st(x_masked)
 
-        return x_masked + (1 - self.mask) * (x * torch.exp(scale) + shift)
+        return self._write(x, x_masked, self._read(x) * torch.exp(scale) + shift)
 
     def forward_logdet(self, x):
         x_masked = x * self.mask
         scale, shift = self._st(x_masked)
+        new = self._read(x) * torch.exp(scale) + shift
 
-        return x_masked + (1 - self.mask) * (x * torch.exp(scale) + shift), scale.sum(1)
+        return self._write(x, x_masked, new), scale.sum(1)
 
     def inverse(self, y):
         y_masked = y * self.mask
         scale, shift = self._st(y_masked)
 
-        return y_masked + (1 - self.mask) * ((y - shift) * torch.exp(-scale))
+        return self._write(y, y_masked, (self._read(y) - shift) * torch.exp(-scale))
 
 
 class FourierShift(torch.nn.Module):
@@ -225,8 +271,8 @@ class FourierShift(torch.nn.Module):
             self.high[-1].weight.mul_(0.0)
             self.high[-1].bias.mul_(0.0)
 
-    def forward(self, x):
-        out = _mlp(self.base, x)
+    def forward(self, x, rows=None):
+        out = _mlp(self.base, x, rows)
 
         if not self.on:
             return out
@@ -238,7 +284,8 @@ class FourierShift(torch.nn.Module):
         else:
             f = x @ self.W + self.b
 
-        shift = _mlp(self.high, torch.cat([f.cos(), f.sin()], -1)) * self.shift_mask
+        mask = self.shift_mask if rows is None else self.shift_mask[rows]
+        shift = _mlp(self.high, torch.cat([f.cos(), f.sin()], -1), rows) * mask
 
         return out + self.eps * shift
 

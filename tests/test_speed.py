@@ -17,6 +17,7 @@ from scipy.stats import ks_2samp
 import flodr.train as ft
 from flodr import FloDR
 from flodr.data import fuzzy_knn_graph, knn_gpu, knn_search
+from flodr.model import Flow, FourierShift
 
 GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="no GPU")
 DEVICES = ["cpu", pytest.param("cuda", marks=GPU)]
@@ -229,6 +230,49 @@ def test_captured_step_follows_the_schedule(frozen):
         )
     )
     assert near != frozen
+
+
+def wide_flow(d=60, seed=0):
+    # the default couplings with the Fourier branch on and every head away from its zero start
+    torch.manual_seed(seed)
+    flow = Flow(d, 4, 32, sketch=16, gate_max=0.5, gate_display=1.0)
+    gen = torch.Generator().manual_seed(seed)
+    for layer in flow.layers:
+        if not bool(layer.mask[:2].any()):
+            layer.net = FourierShift(layer.net, 16, 32, 2 * d, gen=gen)
+            layer.net.on = True
+    with torch.no_grad():
+        for p in flow.parameters():
+            p.add_(0.05 * torch.randn(p.shape, generator=gen))
+    return flow
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_slim_head_is_the_same_map(device):
+    # a coupling that computes only the outputs it reads returns the map, the log-determinant, the
+    # inverse and the gradients of one that computes all of them, to float rounding; the unread rows
+    # of the head keep an exactly zero gradient either way
+    full, slim = wide_flow().to(device), wide_flow().to(device)
+    for layer in slim.layers:
+        layer.slim_head(True)
+    x = torch.randn(300, 60, generator=torch.Generator().manual_seed(1)).to(device)
+    out = []
+    for flow in (full, slim):
+        xg = x.clone().requires_grad_(True)
+        z, ld = flow.forward_with_logdet(xg)
+        ((z[:, :2] ** 2).sum() + 0.1 * ld.sum() + (z[:, 2:] ** 2).mean()).backward()
+        grads = [p.grad for p in flow.parameters() if p.grad is not None]
+        back = flow.inverse(z.detach())
+        out.append([t.detach() for t in [z, ld, back, xg.grad] + grads])
+    for a, b in zip(*out):
+        assert torch.allclose(a, b, rtol=1e-4, atol=1e-5 * float(a.abs().max()))
+    assert torch.allclose(out[1][2], x, atol=1e-4)
+    for layer in slim.layers:
+        net = layer.net.base if isinstance(layer.net, FourierShift) else layer.net
+        head = net[-1]
+        unread = torch.ones(120, dtype=torch.bool, device=device)
+        unread[layer.head_rows] = False
+        assert not head.weight.grad[unread].any() and not head.bias.grad[unread].any()
 
 
 def test_padded_unique():
