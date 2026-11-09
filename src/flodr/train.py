@@ -376,6 +376,21 @@ def _unique_bounds(edge_i, edge_j, n, eb):
     return max(1, round(mu)), min(2 * eb, n, math.ceil(mu + 10 * math.sqrt(var)) + 64)
 
 
+def _compile_step(fn):
+    # sizes are symbolic, so the kernels of one input width serve every data set, where
+    # static sizes compile anew for each; Python numbers stay the constants they are,
+    # as tracing them as symbols first costs a second trace
+    fast = torch.compile(fn, dynamic=True, fullgraph=True)
+    names = ("specialize_int", "specialize_float")
+    held = {name: True for name in names if hasattr(torch._dynamo.config, name)}
+
+    def step(*args):
+        with torch._dynamo.config.patch(**held):
+            return fast(*args)
+
+    return step
+
+
 def _graphs_on(cfg, dev, flow, lin_on):
     if (
         cfg.cudagraphs is False
@@ -1172,6 +1187,9 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
             # endpoints padded to a fixed count, uniforms scaled by the true count, as
             # torch.unique's data-dependent size would sync
             u_mean, u_cap = _unique_bounds(edge_i, edge_j, n, eb_size)
+            # the cap rides on a shape: as a number the compiled step would hold it as a
+            # constant and serve this data set only
+            cap_of = torch.empty(u_cap, dtype=torch.bool, device=dev)
 
             # float64, as a float32 uniform times a large count favours some indices
             def uniform(*size):
@@ -1202,8 +1220,9 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
                 edge_idx, neg_a, neg_b, glob_a, glob_b, rows, pairs, keep, ramp
             ):
                 pts = torch.cat([edge_i[edge_idx], edge_j[edge_idx]])
-                uniq, inv, n_uniq = _padded_unique(pts, u_cap)
-                n_in = n_uniq.clamp_max(u_cap)
+                cap = cap_of.shape[0]
+                uniq, inv, n_uniq = _padded_unique(pts, cap)
+                n_in = n_uniq.clamp_max(cap)
 
                 def pick(u):
                     return torch.minimum((u * n_in).long(), n_in - 1)
@@ -1242,12 +1261,10 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
                 )
 
                 # a batch with more endpoints than the cap is skipped
-                return loss, n_uniq <= u_cap
+                return loss, n_uniq <= cap
 
             loss_fixed = (
-                torch.compile(loss_edges_fixed, dynamic=False, fullgraph=True)
-                if compiled_edges
-                else loss_edges_fixed
+                _compile_step(loss_edges_fixed) if compiled_edges else loss_edges_fixed
             )
 
             def graph_loss(late):
@@ -1283,11 +1300,7 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
 
                     torch.randint(0, n, val.shape, generator=gen, out=val)
 
-            step_fixed = (
-                torch.compile(step, dynamic=False, fullgraph=True)
-                if cfg.graph_compile
-                else step
-            )
+            step_fixed = _compile_step(step) if cfg.graph_compile else step
 
             def graph_loss(late):
                 pairs = [buf.get(key, spare) for key in ("str_a", "str_b")]
