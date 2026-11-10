@@ -14,6 +14,7 @@ import torch
 from scipy.spatial import cKDTree
 from scipy.stats import ks_2samp
 
+import flodr.data as fd
 import flodr.train as ft
 from flodr import FloDR
 from flodr.data import fuzzy_knn_graph, knn_gpu, knn_search
@@ -343,6 +344,33 @@ def test_knn_gpu_is_exact(device):
     # small blocks merge across the reference chunks to the same graph
     d2, i2 = knn_gpu(X, 15, device, cells=2**18)
     assert np.array_equal(i2, i) and np.array_equal(d2, d)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_knn_wide_blocks(device):
+    # blocks wide enough to take their candidates from group minima, with a ragged tail of columns, give
+    # the graph of the exact search and of the narrow blocks that use a plain top-k
+    torch.set_num_threads(2)
+    X = blobs(6000, 20)
+    X[100] = X[7]
+    d, i = knn_gpu(X, 15, device)
+    dr, ir = exact_knn(X, 15)
+    np.testing.assert_allclose(d, dr, rtol=1e-6, atol=1e-6)
+    assert (i == ir).mean() > 0.999
+    d2, i2 = knn_gpu(X, 15, device, cells=2**18)
+    assert np.array_equal(i2, i) and np.array_equal(d2, d)
+
+
+def test_smallest_is_a_top_k():
+    # the values are those of a top-k over the whole block, ties included, each from its own column
+    g = torch.Generator().manual_seed(0)
+    blk = torch.randn(64, 5000, generator=g)
+    blk[:, ::7] = blk[:, 3:4]
+    v, i = fd._smallest(blk, 32)
+    want = torch.topk(blk, 32, dim=1, largest=False)[0]
+    assert torch.equal(torch.sort(v, 1)[0], torch.sort(want, 1)[0])
+    assert torch.equal(torch.gather(blk, 1, i), v)
+    assert all(len(set(row.tolist())) == 32 for row in i)
 
 
 @pytest.mark.parametrize("device", DEVICES)

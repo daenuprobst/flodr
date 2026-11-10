@@ -125,38 +125,71 @@ def knn_query(Xref, Xq, k, metric="euclid"):
     return np.asarray(dist, dtype=np.float64), np.asarray(idx, dtype=np.int64)
 
 
-def _canonical(keys, dist2, k):
-    # (distance, index) order, then self pushed last and dropped
-    n = len(keys)
-    order = np.lexsort((keys, dist2), axis=1)
-    keys = np.take_along_axis(keys, order, axis=1)
-    dist2 = np.take_along_axis(dist2, order, axis=1)
-    order = np.argsort(keys == np.arange(n)[:, None], axis=1, kind="stable")
-    keys = np.take_along_axis(keys, order, axis=1)[:, :k]
-    dist2 = np.take_along_axis(dist2, order, axis=1)[:, :k]
+def _canonical(keys, dist2, first, k):
+    # (distance, index) order, then self pushed last and dropped; rows first, first + 1, ...
+    import torch
 
-    return np.sqrt(dist2), keys
+    keys, order = torch.sort(keys, dim=1, stable=True)
+    dist2, by_dist = torch.sort(torch.gather(dist2, 1, order), dim=1, stable=True)
+    keys = torch.gather(keys, 1, by_dist)
+    own = torch.arange(first, first + len(keys), device=keys.device)[:, None]
+    order = torch.sort((keys == own).to(torch.uint8), dim=1, stable=True)[1]
+
+    return torch.gather(keys, 1, order)[:, :k], torch.gather(dist2, 1, order)[:, :k]
 
 
-def _gpu_blocks(X, Xc, sq, c, cells, rq):
+# columns per group of _smallest
+KNN_GROUP = 32
+
+
+def _smallest(blk, c):
+    # the c smallest of each row. They lie in the c groups of columns with the smallest
+    # minima, so one pass for the minima and two small top-k stand in for a top-k over
+    # the block; among more equal values than c either way returns any c of them
+    import torch
+
+    rows, cols = blk.shape
+    groups = cols // KNN_GROUP
+
+    if groups < 4 * c:
+        return torch.topk(blk, min(c, cols), dim=1, largest=False, sorted=False)
+
+    head = groups * KNN_GROUP
+    mins = blk[:, :head].view(rows, groups, KNN_GROUP).amin(2)
+    pick = torch.topk(mins, c, dim=1, largest=False, sorted=False)[1]
+    cand = pick[:, :, None] * KNN_GROUP + torch.arange(KNN_GROUP, device=blk.device)
+    cand = cand.view(rows, -1)
+
+    if head < cols:
+        tail = torch.arange(head, cols, device=blk.device).expand(rows, -1)
+        cand = torch.cat([cand, tail], 1)
+
+    v, j = torch.topk(torch.gather(blk, 1, cand), c, dim=1, largest=False, sorted=False)
+
+    return v, torch.gather(cand, 1, j)
+
+
+def _gpu_blocks(X, Xc, sq, c, cells, rq, k):
     import torch
 
     n = len(X)
     br = min(n, max(256, cells // 4096))
     bq = min(n, max(1, cells // br))
-    keys = np.empty((n, c), np.int64)
-    dist2 = np.empty((n, c), np.float64)
+    keys = np.empty((n, k), np.int64)
+    dist2 = np.empty((n, k), np.float64)
+    # |x|^2 - 2 q.x as one product, |x|^2 a column against a column of ones: added to
+    # the block afterwards it costs two more passes over the block
+    ref = torch.cat([Xc, sq[:, None]], 1)
+    one = torch.ones_like(sq[:, None])
 
     for qs in range(0, n, bq):
-        q = Xc[qs : qs + bq]
+        q = torch.cat([-2.0 * Xc[qs : qs + bq], one[qs : qs + bq]], 1)
         best_d = best_i = None
 
         for rs in range(0, n, br):
             # |q|^2 is the same along a row, so it is left out of the ranking
-            blk = torch.addmm(sq[None, rs : rs + br], q, Xc[rs : rs + br].T, alpha=-2.0)
-            v, i = torch.topk(
-                blk, min(c, blk.shape[1]), dim=1, largest=False, sorted=False
-            )
+            blk = q @ ref[rs : rs + br].T
+            v, i = _smallest(blk, c)
             i = i + rs
 
             if best_d is not None:
@@ -170,10 +203,11 @@ def _gpu_blocks(X, Xc, sq, c, cells, rq):
             rows = slice(qs + s, qs + s + min(rq, len(q) - s))
             cand = best_i[s : s + rq]
             diff = X[rows][:, None, :].double() - X[cand].double()
+            cand, d2 = _canonical(cand, (diff**2).sum(-1), rows.start, k)
             keys[rows] = cand.cpu().numpy()
-            dist2[rows] = (diff**2).sum(-1).cpu().numpy()
+            dist2[rows] = d2.cpu().numpy()
 
-    return keys, dist2
+    return np.sqrt(dist2), keys
 
 
 def knn_gpu(Xp, k, device="cuda", extra=16, cells=None):
@@ -202,11 +236,9 @@ def knn_gpu(Xp, k, device="cuda", extra=16, cells=None):
                 torch.backends.cuda.matmul.allow_tf32 = False
 
                 try:
-                    keys, dist2 = _gpu_blocks(X, Xc, sq, c, block, rq)
+                    return _gpu_blocks(X, Xc, sq, c, block, rq, k)
                 finally:
                     torch.backends.cuda.matmul.allow_tf32 = tf32
-
-            return _canonical(keys, dist2, k)
         except torch.cuda.OutOfMemoryError:
             if attempt == 3 or cells:
                 raise
