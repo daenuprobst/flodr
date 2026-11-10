@@ -373,6 +373,22 @@ def test_smallest_is_a_top_k():
     assert all(len(set(row.tolist())) == 32 for row in i)
 
 
+def test_smooth_blocks_change_nothing():
+    # the kernel-width search in blocks and threads is the one loop over all cells, bit for bit
+    rng = np.random.default_rng(0)
+    d = np.sort(rng.random((20000, 15)), 1)
+    d -= d[:, :1]
+    d[:5] = 0.0
+    d[5, 1:] = 1e6 * np.arange(1, 15)
+    target = np.log2(15)
+    lo, hi, sigma = np.zeros(len(d)), np.full(len(d), np.inf), np.ones(len(d))
+    for _ in range(64):
+        over = np.exp(-d / sigma[:, None]).sum(1) > target
+        hi[over], lo[~over] = sigma[over], sigma[~over]
+        sigma = np.where(over | np.isfinite(hi), (lo + hi) / 2, sigma * 2)
+    assert np.array_equal(fd._smooth(d, target, 64), sigma)
+
+
 @pytest.mark.parametrize("device", DEVICES)
 def test_knn_gpu_uncentred(device):
     # an offset of 30 moved half the rows' neighbour sets when the fp32 GEMM ran on the data as given

@@ -1,4 +1,5 @@
 import warnings
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from scipy.linalg import null_space
@@ -323,6 +324,26 @@ def knn_search(Xp, k, exact=None, device=None, info=None):
     return np.sqrt(dist2), keys
 
 
+def _smooth(d_clip, target, n_iter):
+    # UMAP's bisection for each cell's kernel width, in blocks that fit the cache and
+    # across the fit's threads; a cell's arithmetic does not depend on its block
+    def block(d):
+        m = len(d)
+        lo, hi, sigma = np.zeros(m), np.full(m, np.inf), np.ones(m)
+
+        for _ in range(n_iter):
+            over = np.exp(-d / sigma[:, None]).sum(1) > target
+            hi[over], lo[~over] = sigma[over], sigma[~over]
+            sigma = np.where(over | np.isfinite(hi), (lo + hi) / 2, sigma * 2)
+
+        return sigma
+
+    blocks = [d_clip[s : s + 8192] for s in range(0, len(d_clip), 8192)]
+
+    with ThreadPoolExecutor(_threads()) as pool:
+        return np.concatenate(list(pool.map(block, blocks)))
+
+
 def fuzzy_knn_graph(
     Xp, k, n_iter=64, precomputed=None, return_dist=False, device=None, info=None
 ):
@@ -340,14 +361,7 @@ def fuzzy_knn_graph(
 
     rho = dist[:, 0]
     d_clip = np.clip(dist - rho[:, None], 0, None)
-    target = np.log2(k)
-    lo, hi, sigma = np.zeros(n), np.full(n, np.inf), np.ones(n)
-
-    for _ in range(n_iter):
-        over = np.exp(-d_clip / sigma[:, None]).sum(1) > target
-        hi[over], lo[~over] = sigma[over], sigma[~over]
-        sigma = np.where(over | np.isfinite(hi), (lo + hi) / 2, sigma * 2)
-
+    sigma = _smooth(d_clip, np.log2(k), n_iter)
     w_attr = np.exp(-d_clip / sigma[:, None])
     rows = np.repeat(np.arange(n), k)
     A = coo_matrix((w_attr.ravel(), (rows, idx.ravel())), shape=(n, n)).tocsr()
