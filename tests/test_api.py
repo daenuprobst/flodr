@@ -61,6 +61,27 @@ def test_budget_rescales_step_size():
     assert raw_recipe(iters=800, lr=0.01).lr == 0.01
 
 
+def test_fast_option():
+    # a quarter of the steps on two couplings, at the step size the step budget gives; max_iter and
+    # advanced still win, and the flow stays a bijection with a density
+    X, _ = blobs(300, 12)
+    m = FloDR(fast=True, device="cpu", verbose=False)
+    m._seed, m._device = 0, "cpu"
+    cfg = m._config(X, None)
+    assert cfg.iters == 1600 and cfg.n_layers == 2 and cfg.lr == pytest.approx(0.01)
+    assert m._config(X, 800).iters == 800
+    m.set_params(advanced={"n_layers": 4, "iters": 100})
+    cfg = m._config(X, None)
+    assert cfg.n_layers == 4 and cfg.iters == 100
+    m = short(fast=True).fit(X)
+    assert len(m.flow_.layers) == 2 and m.n_iter_ == ITERS and m.roundtrip_ < 1e-3
+    np.testing.assert_allclose(
+        m.inverse_latent(m.transform_latent(X[:30])), X[:30], atol=1e-3
+    )
+    assert np.isfinite(m.transform(X[:30])).all()
+    assert np.isfinite(m.score_samples(X[:30])).all()
+
+
 def test_fit(fitted):
     m, X, _ = fitted
     assert m.embedding_.shape == (N, 2) and np.isfinite(m.embedding_).all()
@@ -207,6 +228,7 @@ def test_params():
         "w",
         "density",
         "max_iter",
+        "fast",
         "random_state",
         "device",
         "verbose",
@@ -228,6 +250,7 @@ def test_params():
         dict(n_components=2.0),
         dict(n_components=1),
         dict(max_iter=0),
+        dict(fast="yes"),
         dict(w=-1),
         dict(axes="pca"),
     ],

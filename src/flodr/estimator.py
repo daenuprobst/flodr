@@ -104,6 +104,9 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
         stress_ordinal=True,
         density_noise_cap=0.5,
         heat_landmarks="farthest",
+        # fast=True: a quarter of the steps on two of the four couplings
+        fast_iters=1600,
+        fast_layers=2,
     )
 
     def __init__(
@@ -113,6 +116,7 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
         w=2.0,
         density=True,
         max_iter=None,
+        fast=False,
         random_state=0,
         device=None,
         verbose=True,
@@ -123,6 +127,7 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
         self.w = w
         self.density = density
         self.max_iter = max_iter
+        self.fast = fast
         self.random_state = random_state
         self.device = device
         self.verbose = verbose
@@ -185,6 +190,9 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
         ):
             raise ValueError(f"max_iter must be None or an int >= 1, got {max_iter!r}")
 
+        if not isinstance(self.fast, (bool, np.bool_)):
+            raise ValueError(f"fast must be True or False, got {self.fast!r}")
+
         if self.advanced is not None and not isinstance(self.advanced, dict):
             raise ValueError(f"advanced must be None or a dict, got {self.advanced!r}")
 
@@ -218,6 +226,11 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
 
         if max_iter is not None:
             kw["iters"] = int(max_iter)
+
+        if self.fast:
+            # max_iter and advanced still win
+            kw.setdefault("iters", self._FROZEN["fast_iters"])
+            kw.setdefault("n_layers", self._FROZEN["fast_layers"])
 
         if self.w:
             kw.update(
