@@ -26,6 +26,7 @@ same recall@15 (0.27) the distance order lifts CPD, the rank correlation of inpu
 | `axes` | `"variance"` | start from the leading principal components; `"heat"` starts from the heat geometry of the neighbour graph, which follows branches rather than variance |
 | `density` | `True` | fit the density, needed by `score_samples` and the certificates |
 | `max_iter` | `None` | training steps, 6,400 by default; the step size scales with it |
+| `fast` | `False` | a quarter of the steps on two of the four coupling layers, see [Fast fits](#fast-fits) |
 | `random_state` | `0` | seed; `None` draws one |
 | `device` | `None` | the GPU when PyTorch sees one, else the CPU |
 | `verbose` | `True` | progress bar |
@@ -37,6 +38,16 @@ Pass the representation in which distances should be read, as for UMAP: for sing
 principal components or an integrated latent such as scVI, unscaled. Binary inputs (fingerprints) use Jaccard
 distances. Inputs with fewer than 30 columns are padded with noise columns to 30; new points get zeros there.
 Reduce inputs with thousands of columns first.
+
+## Fast fits
+
+`fast=True` runs 1,600 steps instead of 6,400 on two of the four coupling layers, and a fit is about six times
+faster. On an RTX 4070 Ti the 103,228 cells of the human fetal bone marrow atlas take 27 s instead of 156 s, at a
+recall@15 of 0.180 instead of 0.200 and a CPD of 0.787 instead of 0.793; 5,000 MNIST digits take 8 s instead of 41 s,
+at 0.426 instead of 0.429 and 0.567 instead of 0.572. The flow stays an exact bijection. `transform` places new
+points less precisely on some inputs: of a new MNIST digit's 15 nearest fitted digits, 7 % instead of 11 % are also
+its nearest on the map (bone marrow: 6.5 % instead of 6.9 %). `max_iter` and `advanced` still override the two
+settings.
 
 ## Density preservation
 
