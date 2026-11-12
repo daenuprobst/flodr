@@ -109,6 +109,22 @@ def test_latent_round_trip_is_exact(fitted):
     assert Xi.shape == (30, X.shape[1]) and np.isfinite(Xi).all()
 
 
+def test_decode(fitted):
+    m, X, _ = fitted
+    # one neighbour of a layout position is the fitted point itself, which lies on its
+    # own fibre, so the layout decodes back to the training rows
+    Xd = m.decode(m.embedding_[:30], n_neighbors=1)
+    np.testing.assert_allclose(Xd, X[:30], atol=1e-3)
+    Xd = m.decode(m.embedding_[:30])
+    assert Xd.shape == (30, X.shape[1]) and np.isfinite(Xd).all()
+    # the map places what it decoded at the position, and nearer the row than the zero
+    # residual does
+    if X.shape[1] >= 30:
+        np.testing.assert_allclose(m.transform(Xd), m.embedding_[:30], atol=1e-2)
+    zero = np.abs(m.inverse_transform(m.embedding_[:30]) - X[:30]).mean()
+    assert np.abs(Xd - X[:30]).mean() < zero
+
+
 def test_density(fitted):
     m, X, _ = fitted
     s = m.score_samples(X[:50])

@@ -492,6 +492,78 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
         with torch.no_grad():
             return self._to_raw(self.flow_.inverse(z).cpu().numpy())
 
+    # decodes each position from the fitted points around it: the mean of the nearest on the
+    # layout, moved by Gauss-Newton steps on the layout coordinates onto the fibre of the
+    # position, each step the smallest in input units that closes the gap and halved while it
+    # widens it. The last lines set the position itself, so the map places every returned
+    # input there. The zero residual of inverse_transform, or the mean residual of the same
+    # neighbours, leaves the fitted residuals, and the inverse amplifies that at atlas size
+    def decode(self, Y, n_neighbors=15, tol=1e-3, max_steps=50):
+        check_is_fitted(self)
+        Y = check_array(Y, dtype=np.float32, order="C")
+
+        if Y.shape[1] != self.n_components:
+            raise ValueError(
+                f"Y has {Y.shape[1]} columns but the layout has {self.n_components}"
+            )
+
+        from scipy.spatial import cKDTree
+
+        k, nc = min(int(n_neighbors), len(self.embedding_)), self.n_components
+        tree = cKDTree(self.embedding_)
+        # the tolerance is a share of the spacing of neighbouring fitted points on the layout
+        gap = tol * float(np.median(tree.query(self.embedding_, k=2)[0][:, 1]))
+        nn = tree.query(Y, k=k)[1].reshape(len(Y), -1)
+        dev = next(self.flow_.parameters()).device
+        wh = getattr(self._raw_of, "__self__", None)
+        w = torch.ones(self.flow_.d, device=dev)
+
+        # a plain whitening scales each axis, so the smallest step in the input weighs by it
+        if isinstance(wh, Whitening):
+            sd = np.concatenate([np.ravel(wh.head_sd), np.ravel(wh.tail_sd)])
+            w[: len(sd)] = torch.as_tensor(sd**-2.0, dtype=torch.float32, device=dev)
+
+        # the mean in the coordinates of the fit, which hold the padding of a narrow input
+        z = torch.from_numpy(self._coords[nn].mean(1).astype(np.float32)).to(dev)
+        y = torch.from_numpy(Y).to(dev)
+        eye = torch.eye(nc, device=dev)
+
+        with torch.enable_grad():
+            for _ in range(max_steps):
+                z.requires_grad_(True)
+                out = self.flow_(z)[:, :nc]
+                rows = [
+                    torch.autograd.grad(out[:, c].sum(), z, retain_graph=True)[0]
+                    for c in range(nc)
+                ]
+                J, e, z = torch.stack(rows, 1), (out - y).detach(), z.detach()
+                size = e.norm(dim=1)
+
+                if float(size.max()) < gap:
+                    break
+
+                A = (J * w) @ J.transpose(1, 2)
+                A = A + 1e-10 * A.diagonal(dim1=1, dim2=2).sum(1)[:, None, None] * eye
+                dz = ((J * w).transpose(1, 2) @ torch.linalg.solve(A, e[..., None]))[
+                    ..., 0
+                ]
+                step = torch.ones(len(z), 1, device=dev)
+
+                with torch.no_grad():
+                    for _ in range(6):
+                        worse = (self.flow_(z - step * dz)[:, :nc] - y).norm(
+                            dim=1
+                        ) > size
+                        step[worse] = step[worse] / 2
+
+                    z = z - step * dz
+
+        with torch.no_grad():
+            lat = self.flow_(z)
+            lat[:, :nc] = y
+
+            return self._to_raw(self.flow_.inverse(lat).cpu().numpy())
+
     def inverse_latent(self, Z):
         check_is_fitted(self)
 

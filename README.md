@@ -27,7 +27,7 @@ Y = model.embedding_                         # the map
 
 Y_new = model.transform(X_new)               # one pass through the flow
 Y_opt = model.transform_opt(X_new)           # optimised against the training map, as UMAP's transform
-X_back = model.inverse_transform(Y[:10])     # positions back to the input
+X_back = model.decode(Y[:10])                # positions back to inputs, from the fitted points around them
 Z = model.transform_latent(X_new)            # the map, then the residual
 X_same = model.inverse_latent(Z)             # exact up to float precision
 

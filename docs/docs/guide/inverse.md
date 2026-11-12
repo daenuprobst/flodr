@@ -6,13 +6,18 @@ title: The inverse
 Z = model.transform_latent(X)       # (n, d): the map, then the residual
 X_same = model.inverse_latent(Z)    # exact up to float precision
 X_rep = model.inverse_transform(Y)  # positions only, residual set to zero
+X_dec = model.decode(Y)             # positions only, from the fitted points around them
 ```
 
 Every layer of the flow is an affine coupling, so the map is a bijection and `inverse_latent` undoes
 `transform_latent` exactly. `inverse_transform` decodes a position with the residual set to zero, one input per
 position; the zero of the residual has no meaning of its own.
 
-To decode what the points at a position look like, borrow the residual of the training points nearest it on the map:
+`decode` takes the mean of the 15 fitted points nearest a position on the map and moves it onto the fibre of the
+position: to a nearby input that the map places exactly there. On held-out points it is as accurate as that mean
+and as a decoder trained on the layout, and it needs neither.
+
+By hand, with the residual of the same points instead, which is less accurate on large data sets:
 
 ```python
 from scipy.spatial import cKDTree

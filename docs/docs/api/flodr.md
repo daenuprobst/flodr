@@ -18,6 +18,7 @@ flodr.FloDR.transform_opt
 flodr.FloDR.transform_latent
 flodr.FloDR.inverse_latent
 flodr.FloDR.inverse_transform
+flodr.FloDR.decode
 flodr.FloDR.score_samples
 flodr.FloDR.score
 flodr.FloDR.coverage_certificate
@@ -34,6 +35,7 @@ flodr.FloDR.faithful_scale
 | `transform_latent` | `(m, D)` latent coordinates, the map first, then the residual |
 | `inverse_latent` | `(m, d)` inputs, the exact inverse of `transform_latent` |
 | `inverse_transform` | `(m, d)` inputs decoded with the residual set to zero |
+| `decode` | `(m, d)` inputs decoded from the fitted points around each position |
 | `score_samples` | `(m,)` log density |
 | `score` | mean log density |
 | `coverage_certificate` | dict with `certifies`, `passed`, `fibre` and `map` (`ranks`, `ks`, `band`), `flagged` regions |
