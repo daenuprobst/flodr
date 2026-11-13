@@ -5,17 +5,20 @@ import tempfile
 
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.stats import spearmanr
 
 import common as C
-from ed_fig5 import HOLLOW, spatial, spearman
+import openproblems
 from fig4 import LIM, density_lines
-from fig5 import points
 
 H = 4.05
+# the letters a, b and d end at the same distance from the left edge, in inches
+EDGE = 1.2 - 74 / 72
 DATA = (*C.BENCHMARKS, *C.ATLASES)
 NAMES = "MNIST|Fashion-MNIST|paul15|Schneider50k|bone marrow|cerebellum|seed".split("|")
 # the other methods of Fig. 3, in grey
-REST = "TriMap PaCMAP LocalMAP UMATO ParamRepulsor PHATE PyMDE PCUMAP SQuadMDS PCA-2"
+REST = "DREAMS TriMap PaCMAP LocalMAP UMATO ParamRepulsor PHATE PyMDE PCUMAP SQuadMDS"
+REST += " PCA-2"
 GREY = "#C8C8C8"
 # a, the architecture, drawn by TikZ above the panels
 SCHEMATIC = r"""
@@ -31,7 +34,8 @@ SCHEMATIC = r"""
   sub/.style={font=\fontsize{7}{8.4}\selectfont, text=black!60, align=center},
   arr/.style={-{Latex[length=1.8mm,width=1.6mm]}, semithick, black!80}]
 \useasboundingbox (0,BOTTOM) rectangle (18.288,4.826);
-\node[anchor=north west, inner sep=0pt, font=\fontsize{9}{10}\selectfont\bfseries] at (0,4.8) {a};
+\node[anchor=north east, inner sep=0pt, font=\fontsize{9}{10}\selectfont\bfseries]
+  at (EDGE,4.8) {a};
 \node[box, minimum width=17mm] (x) at (1.15,2.55)
   {$x \in \mathbb{R}^{D}$\\[-0.2mm]{\fontsize{7}{8}\selectfont\color{black!60}cell, $D$ PCs}};
 \node[box, minimum width=13mm] (z) at (3.75,2.55) {$z \in \mathbb{R}^{D}$};
@@ -78,8 +82,13 @@ def style(ax, grid=True):
 def main():
     plt.rcParams.update(C.RC)
     fig = plt.figure(figsize=(C.TEXT_W, H))
-    at = lambda x, y, w, h: fig.add_axes([x / C.TEXT_W, y / H, w / C.TEXT_W, h / H])
-    dot = lambda c, m="o", **kw: plt.Line2D([], [], ls="", marker=m, color=c, **kw)
+
+    def at(x, y, w, h):
+        return fig.add_axes([x / C.TEXT_W, y / H, w / C.TEXT_W, h / H])
+
+    def dot(c, m="o", **kw):
+        return plt.Line2D([], [], ls="", marker=m, color=c, **kw)
+
     # b, seed means on every data set: FloDR, UMAP and openTSNE against the others
     hi = {"FloDR (w=2)": (C.OURS, "o", 26), "UMAP": (*C.METHOD_STYLE["UMAP"], 16)}
     hi["openTSNE"] = (C.METHOD_STYLE["openTSNE"][0], "o", 16)
@@ -101,7 +110,7 @@ def main():
     axes[1].set_xlim(-0.05, 0.95)
     axes[0].set_xlabel("neighbours kept\n(recall@15)", fontsize=7, labelpad=2)
     axes[1].set_xlabel("order of distances\n(CPD)", fontsize=7, labelpad=2)
-    C.letter(axes[0], "b", -46)
+    C.letter(axes[0], "b", (EDGE - 0.86) * 72)
     h = [dot(c, mk, ms=np.sqrt(s) * 0.9, mec="w", mew=0.4) for c, mk, s in hi.values()]
     h.append(dot(GREY, ms=2.6))
     labels = ["FloDR", "UMAP", "openTSNE", f"{len(rest)} other methods"]
@@ -124,7 +133,8 @@ def main():
         ax.set_xticklabels(["0", "0.5", "1"])
         ax.set_yticklabels(["0", "0.5", "1"] if k == 0 else [])
         name = (r"\textbf{FloDR}", "UMAP")[k]
-        ax.set_title(f"{name}, $\\rho = {spearman(dh, dl):.2f}$", fontsize=7)
+        rho = spearmanr(dh, dl).statistic
+        ax.set_title(f"{name}, $\\rho = {rho:.2f}$", fontsize=7)
         ax.set_xlabel("input distance", fontsize=7, labelpad=1)
         style(ax, False)
         if k == 0:
@@ -132,45 +142,45 @@ def main():
             C.letter(ax, "c", -20)
     s = "human fetal bone marrow, 60\\,000 random pairs"
     fig.text(5.37 / C.TEXT_W, 3.86 / H, s, ha="center", fontsize=6.5, color="0.35")
-    # d, measurements that no method sees, with the outcome by the rules of Methods
-    lsk, larry, pop = points()
-    rows = (
-        ("genomes, map\nvs geography", pop, 1, "win"),
-        ("genomes, placed\nvs geography", pop, 2, "win"),
-        ("LSK progenitors\nvs clonal fate", lsk, 1, "win$^\\ast$"),
-        ("LARRY progenitors\nvs clonal fate", larry, 1, "loss"),
-        ("cortical neurons\nvs depth", spatial(), 1, "no claim"),
-    )
-    ax = at(1.2, 0.32, 4.45, 1.18)
-    for i, (_, pts, k, outcome) in enumerate(rows):
-        skip = ("FloDR", "input", *HOLLOW)
-        others = [v[k] for m, v in pts.items() if not m.startswith(skip)]
-        ax.scatter(others, [i] * len(others), s=9, color=GREY, lw=0, zorder=2)
-        ours, inp = pts["FloDR (w=2)"][k], pts["input"][k]
-        ax.scatter(ours, i, s=30, color=C.OURS, lw=0.4, edgecolor="white", zorder=4)
-        ax.scatter(inp, i, s=40, marker="|", color="0.15", lw=1, zorder=3)
-        c = C.OURS_DARK if outcome.startswith("win") else "0.35"
-        tr = ax.get_yaxis_transform()
-        ax.text(1.03, i, outcome, transform=tr, va="center", fontsize=6.5, color=c)
-        print(outcome, round(ours, 3), round(inp, 3), np.round(others, 3))
+    # d, every method of the OpenProblems task by metric family, FloDR and UMAP as in b
+    scores = {m: openproblems.official(S) for m, S in openproblems.scores().items()}
+    rows = {"all 14 metrics": openproblems.METRICS, **openproblems.FAMILIES}
+    ax, green = at(1.2, 0.32, 4.15, 1.18), C.METHOD_STYLE["UMAP"][0]
+    for i, family in enumerate(rows.values()):
+        cols = [openproblems.METRICS.index(k) for k in family]
+        x = {m: S[:, cols].mean() for m, S in scores.items()}
+        ours, dens, umap = (x.pop(m) for m in ("FloDR", "FloDR, density term", "UMAP"))
+        ax.scatter(list(x.values()), [i] * len(x), s=9, color=GREY, lw=0, zorder=2)
+        kw = dict(lw=0.4, edgecolor="white")
+        ax.scatter(umap, i, s=14, marker="s", color=green, zorder=3, **kw)
+        ax.scatter(ours, i, s=30, color=C.OURS, zorder=5, **kw)
+        kw = dict(facecolor="white", edgecolor=C.OURS, lw=0.9)
+        ax.scatter(dens, i, s=26, zorder=4, **kw)
+        # the rank of FloDR at its defaults among the published methods
+        r = 1 + sum(v > ours for v in (umap, *x.values()))
+        text = {1: "1st", 2: "2nd", 3: "3rd"}.get(r, f"{r}th")
+        c, tr = C.OURS_DARK if r == 1 else "0.35", ax.get_yaxis_transform()
+        ax.text(1.03, i, text, transform=tr, va="center", fontsize=6.5, color=c)
     ax.set_ylim(len(rows) - 0.5, -0.5)
-    ax.set_yticks(range(5), [r[0] for r in rows], fontsize=6.5, linespacing=0.95)
-    ax.set_xlim(0.1, 1.0)
-    s = "agreement with the measurement (AUROC or rank correlation)"
+    ax.set_yticks(range(len(rows)), list(rows), fontsize=6.5)
+    ax.set_xlim(0, 1)
+    s = "OpenProblems score, scaled between the controls (mean over "
+    s += f"{len(openproblems.DATASETS)} data sets)"
     ax.set_xlabel(s, fontsize=7, labelpad=2)
     style(ax)
     ax.tick_params(axis="y", length=0, pad=3)
     ax.spines[["top", "right", "left"]].set_visible(False)
-    C.letter(ax, "d", -74)
-    h = [dot(C.OURS, ms=4.5, mec="w", mew=0.4), dot(GREY, ms=3)]
-    h.append(dot("0.15", "|", ms=6, mew=1))
+    C.letter(ax, "d", (EDGE - 1.2) * 72)
+    h = [dot(C.OURS, ms=4.5, mec="w", mew=0.4), dot(C.OURS, ms=4.2, mfc="w", mew=0.9)]
+    h += [dot(green, "s", ms=3.4, mec="w", mew=0.4), dot(GREY, ms=3)]
+    labels = ["FloDR", "FloDR, density term", "UMAP", f"{len(x)} other methods"]
     kw = dict(handletextpad=0.3, labelspacing=0.5, frameon=False, fontsize=6.5)
-    labels = ["FloDR", "other maps", "input, no map"]
     ax.legend(h, labels, loc="upper left", bbox_to_anchor=(1.12, 1.0), **kw)
     # the schematic over the panels, both at print size
     with tempfile.TemporaryDirectory() as tmp:
         fig.savefig(os.path.join(tmp, "panels.pdf"), dpi=300)
         tex = SCHEMATIC.replace("BOTTOM", f"{0.648 - H * 2.54:.3f}")
+        tex = tex.replace("EDGE", f"{EDGE * 2.54:.4f}")
         tex = tex.replace("PREAMBLE", C.RC["text.latex.preamble"])
         open(os.path.join(tmp, "fig1.tex"), "w").write(tex)
         run = dict(cwd=tmp, check=True, stdout=subprocess.DEVNULL)
