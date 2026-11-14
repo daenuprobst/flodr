@@ -1,88 +1,81 @@
+import json
 import os
+import subprocess
+import sys
+import time
+from resource import RUSAGE_SELF, getrusage
 
-import matplotlib
-
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from flodr import viz
-from matplotlib.colors import LogNorm, PowerNorm, TwoSlopeNorm
 
 import common
-from ed_fig6 import COVERAGE, coverage_field, fitted, model
+
+SIZES = (1000, 5000, 10_000, 50_000, 100_000, 500_000, 1_000_000)
+METHODS = ("FloDR (w=2)", "UMAP", "openTSNE", "TriMap", "PaCMAP", "LocalMAP")
+METHODS += ("PHATE", "PyMDE", "PCUMAP", "SQuadMDS", "PCA-2")
+GPU = ("FloDR (w=2)", "PyMDE", "SQuadMDS")
+LABEL = {"FloDR (w=2)": "FloDR", "PCUMAP": "Parametric UMAP"}
 
 
-def readings(ds):
-    # per training cell of the seed-0 map: rho(1), the decoded error of a noise-sized
-    # step over the step, and the lower band of what the input keeps about cell type
-    def make():
-        from flodr.audit import audit
+def cell(m, n):
+    # a fresh interpreter, so the peak memory is the fit's own (labels left unread)
+    X = np.load(os.path.join(common.CACHE, "data", "zebrafish.npz"))["P"]
+    X = np.ascontiguousarray(X[np.random.default_rng(0).permutation(len(X))[:n]])
+    data = getrusage(RUSAGE_SELF).ru_maxrss
+    if m in GPU:
+        import torch
 
-        print(f"faithful scale and audit, {ds}", flush=True)
-        est, (X, labels) = model(ds, 0), common.load(ds)
-        tr = common.split(len(X))[0]
-        res = audit(est.embedding_, X=X[tr], labels=labels[tr].astype(str), test=False)
-        return dict(
-            rho=est.faithful_scale()["rho"][:, 3], lower=res.lower, level=res.level
-        )
+        torch.cuda.reset_peak_memory_stats()
+    t0 = time.perf_counter()
+    common.FIT[m](X, 0, "euclid")
+    secs, peak = time.perf_counter() - t0, getrusage(RUSAGE_SELF).ru_maxrss
+    rec = dict(secs=secs, host_mb=(peak - data) / 1024)
+    if m in GPU:
+        rec["gpu_mb"] = torch.cuda.max_memory_allocated() / 2**20
+    print(json.dumps(rec))
 
-    return common.cached(os.path.join(common.CACHE, "ed_fig7", f"{ds}.npz"), make)
+
+def run(m, n):
+    print(f"fitting {m} on {n} cells", flush=True)
+    common.load("zebrafish")  # built before any measured fit
+    cmd = [sys.executable, os.path.abspath(__file__), m, str(n)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode:
+        return {"failed": r.stderr[-400:]}
+    return json.loads(r.stdout.splitlines()[-1])
 
 
-# rho(1) on a log scale from 0.25 to 10, white where the decoded error equals the step
-mid = np.log(4) / np.log(40)
-RHO = [
-    (0, "#1F5E54"),
-    (mid / 2, "#44AA99"),
-    (mid, "#F2F0F1"),
-    ((1 + mid) / 2, common.OURS),
-]
-HIDDEN = [(0, "#F2EEF1"), (0.15, "#E8D0E2"), (0.45, "#C98AB9"), (0.75, common.OURS)]
-CMAPS = [COVERAGE] + [common.cmap(c + [(1, "#5E1B4F")]) for c in (RHO, HIDDEN)]
-NORMS = (TwoSlopeNorm(0.9, 0.5, 1.0), LogNorm(0.25, 10), PowerNorm(0.5, 0, 1))
-TITLES = ("held-out coverage", r"faithful scale $\rho(1)$", "hidden about cell type")
-TICKS = ([0.5, 0.7, 0.9, 1], [0.25, 0.5, 1, 2, 5, 10], [0, 0.1, 0.25, 0.5, 1])
-LABELS = (
-    "share of held-out cells inside their 90\\% region",
-    r"$\rho(1)$, decoded error over step",
-    "nats, lower 95\\% band",
-)
-
-plt.rcParams.update(common.RC)
-fig = plt.figure(figsize=(common.TEXT_W, common.TEXT_W * 0.86))
-gs = fig.add_gridspec(4, 4, height_ratios=(1, 1, 1, 0.055), hspace=0.06, wspace=0.04)
-gs.update(left=0.04, right=0.995, top=0.965, bottom=0.075)
-for r, ds in enumerate(common.ATLASES):
-    fit, read, labels = fitted(ds, 0), readings(ds), common.load(ds)[1].astype(str)
-    labels = labels[common.split(len(labels))[0]]
-    print(
-        f"{ds}: hides {float(read['level']):.3f} nats about cell type, lower band"
-        f" above zero at {(read['lower'] > 0).mean():.0%} of positions"
-    )
-    axes = [fig.add_subplot(gs[r, c]) for c in range(4)]
-    colours = common.class_colours(labels)[1]
-    viz.plot_embedding(fit["Y"], labels, ax=axes[0], colours=colours, s=0.5)
-    axes[0].set_ylabel(common.NAMES_2L[ds], fontsize=7.5)
-    values = (coverage_field(fit), read["rho"], np.clip(read["lower"], 0, None))
-    for ax, v, norm, cmap, o in zip(
-        axes[1:], values, NORMS, CMAPS, ("low", "high", "high")
-    ):
-        viz.plot_embedding(
-            fit["Y"], values=v, ax=ax, cmap=cmap, norm=norm, s=0.5, order=o
-        )
-    for c, title in enumerate(("cell type",) + TITLES if r == 0 else ()):
-        axes[c].set_title(title, fontsize=8)
-        common.letter(axes[c], "abcd"[c])
-for c in range(3):
-    cax = fig.add_subplot(gs[3, c + 1].subgridspec(1, 3, width_ratios=(1, 8, 1))[0, 1])
-    sm = plt.cm.ScalarMappable(NORMS[c], CMAPS[c])
-    cb = fig.colorbar(
-        sm, cax, orientation="horizontal", extend=("min", "both", "max")[c]
-    )
-    labels = [f"{t:g}" for t in TICKS[c]]
-    cb.set_ticks(TICKS[c], labels=["$\\le$0.5"] + labels[1:] if c == 0 else labels)
-    cb.ax.minorticks_off()
-    cb.ax.tick_params(labelsize=6.5, length=2, pad=1.5)
-    cb.outline.set_linewidth(0.4)
-    cb.set_label(LABELS[c], fontsize=7, labelpad=2)
+if len(sys.argv) == 3:
+    sys.exit(cell(sys.argv[1], int(sys.argv[2])))
+path = os.path.join(common.CACHE, "ed_fig7", "scaling.json")
+thin = {"axes.linewidth": 0.6, "xtick.major.width": 0.6, "ytick.major.width": 0.6}
+plt.rcParams.update({**common.RC, **thin, "axes.axisbelow": True})
+fig, axes = plt.subplots(1, 3, figsize=(common.TEXT_W, 2.6))
+for m in METHODS:
+    ok = []
+    for n in SIZES:
+        rec = common.memo(path, f"{m}@{n}", lambda: run(m, n))
+        # a method that fails is not tried at larger n
+        if "failed" in rec:
+            break
+        ok.append((n, rec))
+    ns, big = [n for n, _ in ok], m == "FloDR (w=2)"
+    colour, marker = common.METHOD_STYLE[LABEL.get(m, m)]
+    kw = dict(color=colour, marker=marker, label=LABEL.get(m, m), mec="w", mew=0.4)
+    kw.update(lw=1.6 if big else 0.9, ms=4.5 if big else 3, zorder=6 if big else 3)
+    axes[0].loglog(ns, [r["secs"] for _, r in ok], **kw)
+    # Parametric UMAP fits in a worker process whose memory this one cannot see
+    if m != "PCUMAP":
+        axes[1].loglog(ns, [max(r["host_mb"], 1) for _, r in ok], **kw)
+    if m in GPU:
+        axes[2].loglog(ns, [max(r["gpu_mb"], 1) for _, r in ok], **kw)
+ylabels = ("wall time (s)", "peak host memory above input (MB)", "peak GPU memory (MB)")
+for ax, ylabel, letter in zip(axes, ylabels, "abc"):
+    ax.set(xlabel="$n$ cells", ylabel=ylabel)
+    ax.grid(True, lw=0.4, color="0.88")
+    common.letter(ax, letter)
+kw = dict(ncol=6, frameon=False, fontsize=7, handletextpad=0.4, columnspacing=1.0)
+handles = axes[0].get_legend_handles_labels()
+fig.legend(*handles, loc="lower center", bbox_to_anchor=(0.5, -0.02), **kw)
+fig.tight_layout(rect=(0, 0.12, 1, 1), w_pad=1.2)
 common.save(fig, "ed_fig7.pdf")

@@ -642,7 +642,6 @@ RC = {
     r"\renewcommand{\familydefault}{\sfdefault}\usepackage{sansmath}\sansmath",
 }
 OURS, OURS_DARK, OURS_LIGHT = "#AA4499", "#882255", "#E3B6D6"
-PARTNER = "#44AA99"
 TOL = (
     "#CC6677",
     "#332288",
