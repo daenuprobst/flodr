@@ -1,232 +1,211 @@
-import functools
+import ast
+import json
 import os
+import pickle
+import shutil
+import subprocess
+import sys
+import tempfile
 
 import numpy as np
-import torch
-from scipy.spatial import cKDTree
 
-import common
-import supp_table2 as T
+from common import ROOT, memo, out
+from openproblems import DIR, embed, fetch
 
-
-def no_collapse(R):
-    # the flow's if the encoder collapses more placed cells than FloDR, pooled, by more
-    # than 1% of them, with no data set against
-    c = T.welch(R, "collapse", "mlp", "flodr")
-    against = any(p["ci"][1] < 0 for p in c["per"].values())
-    return "flow" if c["ci"][0] > 0 and c["diff"] > 0.01 and not against else "none"
-
-
-def stable_data(ds):
-    # the follow-up reads paul15 with its components unscaled
-    X, y = common.paul15_pcs()[:2] if ds == "paul15" else T.data(ds)
-    return X, np.unique(y, return_inverse=True)[1]
-
-
-def queries(y):
-    # 300 held-out cells to place; the other held-out cells fill three random batches
-    # and one batch of each of the two commonest types among them
-    te = common.split(len(y))[1]
-    q = np.sort(np.random.default_rng(11).choice(te, 300, replace=False))
-    others = np.setdiff1d(te, q)
-    n, rng = min(700, len(others) // 2), np.random.default_rng(12)
-    batches = [np.sort(rng.choice(others, n, replace=False)) for _ in range(3)]
-    names, counts = np.unique(y[others], return_counts=True)
-    for t in names[np.argsort(-counts)[:2]]:
-        pool = others[y[others] == t]
-        batches.append(np.sort(rng.choice(pool, min(n, len(pool)), replace=False)))
-    return q, batches
+# version 1 of the task, the leaderboard of the OpenProblems website. Its results.json,
+# method_info.json and metric_info.json go into V1, and its metric functions are those
+# of github.com/openproblems-bio/openproblems at commit 65efdc8, checked out at REPO
+V1, REPO = os.path.join(DIR, "v1"), os.path.join(DIR, "openproblems")
+# an interpreter pinned as the image of the task was: python 3.8, numpy 1.23,
+# scipy 1.9, scikit-learn 1.1, anndata 0.8, scanpy 1.9, umap-learn 0.5.3, numba
+PYTHON = os.environ.get(
+    "OPENPROBLEMS_PYTHON", os.path.join(ROOT, ".venv-openproblems", "bin", "python")
+)
+# the files of the data sets on figshare
+DATASETS = {
+    "olsson_2016_mouse_blood": "36872214",
+    "mouse_hspc_nestorowa2016": "36088649",
+    "tenx_5k_pbmc": "25555739",
+    "zebrafish_labs": "24566651?private_link=e3921450ec1bd0587870",
+}
+# FloDR at its defaults and with the density term, by its weight
+VARIANTS = {"flodr_logCP10k": 0.0, "flodr_density_logCP10k": 2.0}
 
 
-def stable_cell(ds, arm, seed):
-    # the queries placed inside the first batch and, at seed 0, alone, inside each
-    # batch, at one and eight CPU threads and on the GPU
-    def make():
-        import numba
-        import umap
-        from flodr.estimator import _flow_to
+def shim():
+    # a minimal openproblems package: the metric files of the task unchanged and, of the
+    # modules they import, the functions they call (the rest imports R and scprep)
+    src, dst = os.path.join(REPO, "openproblems"), os.path.join(V1, "shim")
+    task = "tasks/dimensionality_reduction"
+    if os.path.exists(dst):
+        return dst
 
-        X, y = stable_data(ds)
-        tr = common.split(len(X))[0]
-        q, batches = queries(y)
-        if arm == "umap":
-            est = umap.UMAP(n_neighbors=15, min_dist=0.1, init="pca", random_state=seed)
-            est.fit(X[tr])
-        else:
-            est = T.fit_map(arm, X[tr], seed)
-        out = dict(Y=est.embedding_)
-        threads = numba.get_num_threads(), torch.get_num_threads()
-        for tf in ("transform", "transform_opt") if arm == "flodr" else ("transform",):
-            place = getattr(est, tf)
-            out[tf] = place(X[np.r_[q, batches[0]]])[:300]
-            if seed:
-                continue
-            P = [np.concatenate([place(X[[i]]) for i in q])]
-            P += [place(X[np.r_[q, b]])[:300] for b in batches]
-            for t in (1, 8):
-                if arm == "umap":
-                    numba.set_num_threads(t)
-                else:
-                    torch.set_num_threads(t)
-                    _flow_to(est.flow_, "cpu")
-                P.append(place(X[q]))
-            if arm != "umap" and torch.cuda.is_available():
-                _flow_to(est.flow_, "cuda")
-                P.append(place(X[q]))
-            numba.set_num_threads(threads[0])
-            torch.set_num_threads(threads[1])
-            out[tf + "_conditions"] = np.stack(P)
-        return out
+    def functions(path, names):
+        text = open(os.path.join(src, path)).read()
+        found = []
+        for node in ast.parse(text).body:
+            if isinstance(node, ast.FunctionDef) and node.name in names:
+                first = node.decorator_list[0] if node.decorator_list else node
+                lines = text.splitlines()[first.lineno - 1 : node.end_lineno]
+                found.append("\n".join(lines))
+        assert len(found) == len(names), (path, names)
+        return "\n\n\n".join(found) + "\n"
 
-    return common.cached(
-        os.path.join(T.DIR, "stability", f"{ds}_{arm}_s{seed}.npz"), make
-    )
+    def write(path, text=""):
+        path = os.path.join(tmp, "openproblems", path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w").write(text)
 
-
-def majority(L):
-    # the commonest code along the last axis, ties to the lower code
-    return np.stack([(L == t).sum(-1) for t in range(L.max() + 1)], -1).argmax(-1)
-
-
-@functools.cache
-def placement_test():
-    # per query: spread over the conditions in median map spacings, flips of the region
-    # label (majority of the 15 nearest training cells) over the conditions and over
-    # seeds 0-4, recall@15, and agreement of the region label with the input neighbours.
-    # Registered: FloDR's transform flips less than UMAP.transform over conditions and
-    # over seeds, by two paired standard errors, and loses at most 0.02 in recall and
-    # label agreement (95% bound), on both data sets
-    res = {}
-    for ds in ("paul15", "bmarrow20k"):
-        X, y = stable_data(ds)
-        tr, q = common.split(len(X))[0], queries(y)[0]
-        yt, in15 = y[tr], cKDTree(X[tr]).query(X[q], k=15)[1]
-        for arm, tf in (
-            ("flodr", "transform"),
-            ("flodr", "transform_opt"),
-            ("mlp", "transform"),
-            ("umap", "transform"),
-        ):
-            c = [stable_cell(ds, arm, s) for s in range(5)]
-            E0, P = c[0]["Y"], c[0][tf + "_conditions"]
-            sp = np.median(cKDTree(E0).query(E0, k=2)[0][:, 1])
-            L = [majority(yt[cKDTree(E0).query(p, k=15)[1]]) for p in P]
-            nn = [cKDTree(x["Y"]).query(x[tf], k=15)[1] for x in c]
-            Ls = np.stack([majority(yt[i]) for i in nn])
-            hits = [[len(np.intersect1d(a, b)) for a, b in zip(in15, i)] for i in nn]
-            res[ds, arm if tf == "transform" else "flodr_opt"] = dict(
-                sd=np.sqrt(((P - P.mean(0)) ** 2).sum(-1).mean(0)) / sp,
-                flip_proc=(np.stack(L) != L[0]).any(0),
-                flip_seed=(Ls != majority(Ls.T)).any(0),
-                recall=np.mean(hits, 0) / 15,
-                agree=(Ls == majority(yt[in15])).mean(0),
-            )
-
-    def passes(key, sign, z, low):
-        # the bound mean - z SE of sign * (FloDR - UMAP.transform) above low, both sets
-        for ds in ("paul15", "bmarrow20k"):
-            d = sign * (res[ds, "flodr"][key] - res[ds, "umap"][key].astype(float))
-            if d.mean() - z * d.std(ddof=1) / np.sqrt(len(d)) <= low:
-                return False
-        return True
-
-    tests = {
-        "accuracy": passes("recall", 1, 1.96, -0.02)
-        and passes("agree", 1, 1.96, -0.02),
-        "stability over conditions": passes("flip_proc", -1, 2, 0),
-        "seed stability": passes("flip_seed", -1, 2, 0),
-    }
-    return res, [name for name, ok in tests.items() if not ok]
+    tmp = dst + ".part"
+    shutil.rmtree(tmp, ignore_errors=True)
+    for d in ("", "data", "tools", "tasks", task, f"{task}/metrics", f"{task}/methods"):
+        write(os.path.join(d, "__init__.py"))
+    files = [f"metrics/{f}.py" for f in ("density", "distance_correlation")]
+    files += ["metrics/nn_ranking.py", "metrics/trustworthiness.py"]
+    for f in files + ["methods/diffusion_map.py"]:
+        write(f"{task}/{f}", open(os.path.join(src, task, f)).read())
+    head = "import anndata\nimport functools\nimport logging\n\n"
+    head += 'log = logging.getLogger("openproblems")\n\n\n'
+    head += "def _backport_code_version(apply_method, code_version):\n"
+    head += '    apply_method.metadata["code_version"] = code_version\n'
+    head += "    return apply_method\n\n\n"
+    names = ["normalizer", "method", "metric"]
+    write("tools/decorators.py", head + functions("tools/decorators.py", names))
+    head = "from . import decorators\n\nimport anndata as ad\nimport logging\n\n"
+    head += 'log = logging.getLogger("openproblems")\n\n\n'
+    names = ["_cp10k", "log_cp10k"]
+    write("tools/normalize.py", head + functions("tools/normalize.py", names))
+    write("tools/utils.py", 'def check_version(pkg):\n    return "shim"\n')
+    head = "import numpy as np\nimport scipy.sparse\n\n\n"
+    names = ["_fix_matrix_format", "_fix_adata", "filter_genes_cells"]
+    write("data/utils.py", head + functions("data/utils.py", names))
+    os.replace(tmp, dst)
+    return dst
 
 
-def sci(x):
-    m, e = f"{x:.0e}".split("e")
-    return rf"{m}\times10^{{{int(e)}}}"
-
-
-def rows():
-    fwd = T.e1("M2r forward recall")["per"]
-    opt = T.within(
-        *(r["diff"] for r in T.e1("M2r opt recall")["per"].values()),
-        T.welch(T.E("E3"), "M2r opt recall", "flodr", "mlp")["diff"],
-        T.e4("M2r opt recall", "flodr", "mlp")["diff"],
-    )
-    free = [
-        -T.e6("bmarrow20k", "M2r opt recall", a, "free")["diff"]
-        for a in ("flodr", "mlp")
-    ]
-    fo = T.e4("M2r opt recall", "flodr", "free")["per"]["bmarrow"]
-    atlas = T.e4("M2r forward recall", "flodr", "mlp")["diff"]
-    donor = T.welch(T.E("E3"), "M2r forward recall", "flodr", "mlp")["diff"]
-    E = {
-        ds: [
-            np.mean([v["M1 recall"] for v in r.values()])
-            for r in T.E("E2")[ds].values()
-        ]
-        for ds in T.E("E2")
-    }
-    pad = -T.welch(T.E("E2"), "M1 recall", "flodr", "mlp_pad")["diff"]
-    rt = [
-        T.cell("flodr", ds, p, s)["rt"]
-        for ds in T.SUBSETS
-        for p in ("full", "tr", "A", "B")
-        for s in range(10)
-    ]
-    res, failed = placement_test()
-    sd = {
-        a: sorted(res[ds, a]["sd"].mean() for ds in ("paul15", "bmarrow20k"))
-        for a in ("flodr_opt", "umap")
-    }
-    fails = " and ".join(failed)
-    text = rf"""
-Placement by one forward pass & FloDR minus encoder ${fwd["paul15"]["diff"]:+.3f}$ on
-paul15, ${fwd["bmarrow20k"]["diff"]:+.3f}$ on the bone marrow subsample and
-${fwd["mnist10k"]["diff"]:+.3f}$ on MNIST (E1); both functions above interpolated free
-coordinates on paul15 and the bone marrow subsample, below on MNIST; FloDR ties
-UMAP.transform on paul15 and the bone marrow subsample and loses on MNIST (E6). On the
-atlas, FloDR is above the encoder by ${atlas:.3f}$ (E4), which the code does not score
-as a property \\
-
-Placement by the optimised transform & benchmarks: both functions above free coordinates
-only on the bone marrow subsample, by ${free[0]:.3f}$ and ${free[1]:.3f}$, and tied on
-paul15 and MNIST, so neither the function nor the objective rule is met (E6). Atlas:
-free coordinates ${-fo["diff"]:.3f}$ above FloDR, ${fo["b"]:.3f}$ against
-${fo["a"]:.3f}$ (E4). FloDR within ${opt:.3f}$ of the encoder (E1, E3, E4); both above
-UMAP.transform on held-out donors (E3) \\
-
-Same placement alone, in any batch, thread count or device & FloDR and the encoder place
-every cell at the same position, the optimised transform to within
-${sci(sd["flodr_opt"][1])}$ map spacings; UMAP.transform moves cells by
-${sd["umap"][0]:.1f}$ to ${sd["umap"][1]:.1f}$ spacings. Free-coordinate placement was
-not an arm, and the registered test failed on {fails} (follow-up on the library
-4801f79192a1e7ac) \\
-
-Cells from held-out donors & FloDR above the encoder by ${donor:.3f}$ in recall of the
-forward pass; both below UMAP.transform (E3) \\
-
-No collapse of new inputs & neither map collapsed a held-out cell type (E5) \\
-
-Narrow inputs & FloDR, the encoder with and without padding and free coordinates at
-${min(E["scpoli10"]):.3f}$ to ${max(E["scpoli10"]):.3f}$ in recall on the scPoli latent
-and ${min(E["scvi10"]):.3f}$ to ${max(E["scvi10"]):.3f}$ on the scVI latent, three
-seeds, with the padded encoder above FloDR by ${pad:.3f}$ (E2) \\
-
-Exact inverse and density & largest absolute round-trip error in whitened coordinates
-${sci(min(rt))}$ to ${sci(max(rt))}$ over the {len(rt)} FloDR fits of E1, and up to
-$1.5\times10^{{-4}}$ on the atlas fits of Extended Data Fig.~\ref{{fig:diagnostics}};
-the density is exact and normalised, and describes the data only where the map is
-near-linear at the noise scale \\
-
-Inverse, density and placement agree & every decoded draw is placed at its own position
-without a solver; a separate decoder gains the same consistency by projection onto the
-fibres, with a solver (Supplementary Note~\ref{{sec:flowonly}}) \\
-
-Hidden-information audit & needs only the inputs, a map and the labels \\
+# runs in this interpreter to read a data set and in that of the task to score it
+_TASK = """
+import hashlib, json, pickle, sys
+import anndata, numpy as np
+mode, shim, data, emb, out, metrics = json.loads(sys.argv[1])
+sys.path.insert(0, shim)
+from openproblems.data.utils import _fix_adata, filter_genes_cells
+from openproblems.tools.normalize import log_cp10k
+# the data set as the task hands it to methods and metrics
+adata = anndata.read_h5ad(data)
+filter_genes_cells(adata)
+_fix_adata(adata)
+adata.uns["n_genes"] = adata.shape[1]
+adata = log_cp10k(adata)
+adata.strings_to_categoricals()
+names = np.asarray(adata.obs_names, dtype=str)
+if mode == "read":
+    pickle.dump((adata.X, names), open(out, "wb"))
+    sys.exit()
+from openproblems.tasks.dimensionality_reduction.metrics import density
+from openproblems.tasks.dimensionality_reduction.metrics import distance_correlation
+from openproblems.tasks.dimensionality_reduction.metrics import nn_ranking
+from openproblems.tasks.dimensionality_reduction.metrics import trustworthiness
+modules = (density, distance_correlation, trustworthiness, nn_ranking)
+fns = {k: getattr(m, k) for m in modules for k in metrics if hasattr(m, k)}
+# the six co-ranking metrics each fit the same pair of matrices
+fit, last = nn_ranking._fit, {}
+def digest(a):
+    return hashlib.sha1(np.ascontiguousarray(a).tobytes()).hexdigest()
+def once(X, E):
+    key = digest(X), digest(np.asarray(E))
+    if key not in last:
+        last.clear()
+        last[key] = fit(X, E)
+    return last[key]
+nn_ranking._fit = once
+z = np.load(emb)
+assert (names == z["obs_names"]).all()
+res = {}
+for m in z.files:
+    if m != "obs_names":
+        adata.obsm["X_emb"] = z[m]
+        res[m] = {k: float(fns[k](adata)) for k in metrics}
+json.dump(res, open(out, "w"))
 """
-    return [" ".join(r.split()) for r in text.strip().split("\n\n")]
 
 
-if __name__ == "__main__":
-    text = "\n".join(rows())
-    open(common.out("supp_table3.tex"), "w").write(text + "\n")
-    print(text)
+def run(name, metrics):
+    # FloDR on one data set: fitted here on the task's normalised counts, then scored by
+    # the task's metric functions in its interpreter
+    url = "https://ndownloader.figshare.com/files/" + DATASETS[name]
+    data = fetch(url, os.path.join(V1, "data", f"{name}.h5ad"))
+    emb = os.path.join(V1, "emb", f"{name}.npz")
+    with tempfile.TemporaryDirectory() as tmp:
+        f = os.path.join(tmp, "out")
+
+        def task(python, mode):
+            args = json.dumps([mode, shim(), data, emb, f, metrics])
+            subprocess.run([python, "-c", _TASK, args], check=True)
+
+        if not os.path.exists(emb):
+            task(sys.executable, "read")
+            X, names = pickle.load(open(f, "rb"))
+            maps = {m: embed(X, w) for m, w in VARIANTS.items()}
+            os.makedirs(os.path.dirname(emb), exist_ok=True)
+            np.savez(emb, obs_names=names, **maps)
+        task(PYTHON, "score")
+        return json.load(open(f))
+
+
+def published(name):
+    return json.load(open(os.path.join(V1, f"{name}.json")))
+
+
+results, info = published("results"), published("method_info")
+METRICS = [m["metric_id"] for m in published("metric_info")]
+baselines = {m["method_id"] for m in info if m.get("is_baseline")}
+pub = {(r["method_id"], r["dataset_id"]): r["metric_values"] for r in results}
+# FloDR on the metrics the published results have for the data set, four on zebrafish
+ours = {}
+for d in DATASETS:
+    have = sorted({k for (_, ds), v in pub.items() if ds == d for k in v})
+    ours[d] = memo(os.path.join(V1, "scores.json"), d, lambda: run(d, have))
+
+# each metric is scaled per data set between the lowest and the highest baseline
+bounds = {}
+for d in DATASETS:
+    for k in METRICS:
+        bv = [pub[b, d][k] for b in baselines if k in pub[b, d]]
+        bounds[d, k] = (min(bv), max(bv)) if len(bv) >= 2 else None
+# which reproduces the published scaled scores
+for r in results:
+    for k, v in r["scaled_scores"].items():
+        lo, hi = bounds[r["dataset_id"], k]
+        assert abs((r["metric_values"][k] - lo) / (hi - lo) - v) < 1e-12
+
+
+def cells(values):
+    # as on the website: clipped to [0, 1], a missing value counts as zero
+    S = np.zeros((len(DATASETS), len(METRICS)))
+    for i, d in enumerate(DATASETS):
+        for j, k in enumerate(METRICS):
+            if values[d].get(k) is not None and bounds[d, k]:
+                lo, hi = bounds[d, k]
+                S[i, j] = np.clip((values[d][k] - lo) / (hi - lo), 0, 1)
+    return S
+
+
+# FloDR, then the published methods under their published names, by their mean
+names = {"flodr_logCP10k": "FloDR", "flodr_density_logCP10k": "FloDR, density term"}
+names |= {m["method_id"]: m["method_name"] for m in info}
+S = {m: cells({d: ours[d][m] for d in DATASETS}) for m in VARIANTS}
+rest = sorted({m for m, _ in pub} - baselines)
+rest = {m: cells({d: pub[m, d] for d in DATASETS}) for m in rest}
+S.update(sorted(rest.items(), key=lambda t: -t[1].mean()))
+
+lines = [r"Method & Myeloid & HSPC & PBMC & Zebrafish & Mean \\", r"\midrule"]
+for m, s in S.items():
+    means = [f"{x:.3f}" for x in (*s.mean(1), s.mean())]
+    name = names[m].replace("gamma=0", r"$\gamma=0$")
+    lines.append(f"{name} & " + " & ".join(means) + r" \\")
+    if m == "flodr_density_logCP10k":
+        lines.append(r"\midrule")
+
+open(out("supp_table3.tex"), "w").write("\n".join(lines) + "\n")
+print("\n".join(lines))

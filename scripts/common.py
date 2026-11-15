@@ -156,33 +156,11 @@ def _atlas(name):
     return pca50(a.X), y
 
 
-def _subset(X, y, n):
-    rows = np.sort(np.random.default_rng(1).choice(len(X), n, replace=False))
-    return X[rows], y[rows]
-
-
-def _mnist10k():
-    from sklearn.datasets import fetch_openml
-
-    X, y = fetch_openml(
-        "mnist_784", version=1, as_frame=False, return_X_y=True, parser="auto"
-    )
-    X, y = _subset(X, np.unique(y, return_inverse=True)[1], 10_000)
-    X = X.astype(np.float32) / 255.0
-    return (X - X.mean()) / X.std(), y
-
-
-def _hnoca():
-    # the scPoli latent and its labels, range-read out of the 18.7 GB h5ad (about 80 MB)
-    import fsspec
-    import h5py
-    from anndata.io import read_elem
-
-    url = "https://zenodo.org/records/14161275/files/hnoca_cleanedmeta.h5ad?download=1"
-    fs = fsspec.filesystem("http", block_size=16 * 1024 * 1024)
-    with fs.open(url, "rb") as fh, h5py.File(fh, "r") as f:
-        Z = np.asarray(read_elem(f["obsm"]["X_scpoli"]), np.float32)
-        return Z, np.asarray(read_elem(f["obs"]["annot_level_2"])).astype(str)
+def split(n, test=0.2):
+    # the 80/20 split of the held-out experiments: (train, test)
+    perm = np.random.default_rng(0).permutation(n)
+    k = round(test * n)
+    return np.sort(perm[k:]), np.sort(perm[:k])
 
 
 def _zebrafish():
@@ -198,35 +176,6 @@ def _zebrafish():
     return pca50(a.X), y
 
 
-def paul15_pcs():
-    # the 50 principal components without per-component scaling, the labels, and the
-    # linear readout of the 1000 highly variable genes (log expression) from them
-    import scanpy as sc
-    from sklearn.decomposition import PCA
-
-    sc.settings.datasetdir = DATA
-    a = sc.datasets.paul15()
-    labels = np.asarray(a.obs["paul15_clusters"]).astype(str)
-    sc.pp.filter_genes(a, min_counts=1)
-    sc.pp.normalize_total(a, target_sum=1e4)
-    sc.pp.log1p(a)
-    sc.pp.highly_variable_genes(a, n_top_genes=1000, subset=True)
-    expr = np.asarray(a.X, np.float64)
-    sc.pp.scale(a, max_value=10)
-    pca = PCA(50, svd_solver="randomized", random_state=0)
-    P = pca.fit_transform(np.asarray(a.X, np.float64)).astype(np.float32)
-    sd, mean = a.var["std"].to_numpy(), a.var["mean"].to_numpy()
-    W, b = pca.components_ * sd, pca.mean_ * sd + mean
-    return P, labels, dict(genes=list(a.var_names), expr=expr, W=W, b=b)
-
-
-def split(n, test=0.2):
-    # the 80/20 split of the held-out experiments: (train, test)
-    perm = np.random.default_rng(0).permutation(n)
-    k = round(test * n)
-    return np.sort(perm[k:]), np.sort(perm[:k])
-
-
 def load(name):
     path = (
         os.path.join(CACHE, "scrna", f"{name}.npz")
@@ -239,9 +188,6 @@ def load(name):
             "fmnist": lambda: _openml("Fashion-MNIST"),
             "paul15": _paul15,
             "drfp": _drfp,
-            "bmarrow20k": lambda: _subset(*load("bmarrow"), 20_000),
-            "mnist10k": _mnist10k,
-            "hnoca": _hnoca,
             "zebrafish": _zebrafish,
         }.get(name, lambda: _atlas(name))()
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -254,7 +200,7 @@ def metric(ds, method=""):
     return (
         "jaccard"
         if ds == "drfp"
-        and method.split(" ")[0] in ("FloDR", "UMAP", "openTSNE", "Free", "DREAMS")
+        and method.split(" ")[0] in ("FloDR", "UMAP", "openTSNE", "DREAMS")
         else "euclid"
     )
 
@@ -444,70 +390,6 @@ def _squadmds(X, seed, metric, n_iter=4000):
     return Y.detach().cpu().numpy()
 
 
-def fit_free(X, seed, metric="euclid", steps=6400, lr=0.05):
-    # the FloDR objective at w = 2 on free coordinates from the whitened PCA start, Adam
-    # with a linear decay; the same graph, kernel and terms as the library
-    import torch
-    from flodr import find_ab, fuzzy_knn_graph, raw_coords
-    from flodr.data import knn_query
-    from flodr.estimator import prune_fraction
-
-    dev = "cuda" if torch.cuda.is_available() else "cpu"
-    gen = torch.Generator(device=dev).manual_seed(seed)
-    n = len(X)
-    pre = knn_query(X, None, K, "jaccard") if metric == "jaccard" else None
-    _, ei, ej, wa, _ = fuzzy_knn_graph(X, K, precomputed=pre, return_dist=True)
-    if prune_fraction(n) < 1.0:
-        sel = np.sort(np.argsort(-wa)[: round(prune_fraction(n) * len(wa))])
-        ei, ej, wa = ei[sel], ej[sel], wa[sel]
-    ei, ej = torch.as_tensor(ei, device=dev), torch.as_tensor(ej, device=dev)
-    wa = torch.as_tensor(np.asarray(wa, np.float32), device=dev)
-    a, b = find_ab(0.01)
-    Y0 = raw_coords(X, 50, seed)[0][:, :2]
-    Y = torch.nn.Parameter(torch.as_tensor((Y0 - Y0.mean(0)) / Y0.std(), device=dev))
-    opt = torch.optim.Adam([Y], lr=lr)
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda i: 1.0 - i / steps)
-    xs = torch.as_tensor(np.asarray(X, np.float32), device=dev)
-    rs = xs.sum(1)
-
-    def log_dx(r, s):
-        if metric == "jaccard":
-            inter = (xs[r] * xs[s]).sum(1)
-            jac = 1.0 - inter / (rs[r] + rs[s] - inter).clamp_min(1.0)
-            return torch.log(jac.clamp_min(1e-6))
-        return 0.5 * torch.log(((xs[r] - xs[s]) ** 2).sum(1).clamp_min(1e-12))
-
-    def draw(size, high=n):
-        return torch.randint(0, high, (size,), device=dev, generator=gen)
-
-    def d2(p, q):
-        return ((Y[p] - Y[q]) ** 2).sum(1)
-
-    def q(x):
-        return 1.0 / (1.0 + a * (x + 1e-6) ** b)
-
-    for it in range(steps):
-        e = draw(262_144, len(ei)) if len(ei) > 262_144 else slice(None)
-        l_attr = -(wa[e] * torch.log(q(d2(ei[e], ej[e])) + 1e-6)).sum() / wa[e].sum()
-        m = len(wa[e])
-        l_rep = -torch.log(1.0 - q(d2(draw(48 * m), draw(48 * m))) + 1e-6).mean()
-        dg = d2(draw(3 * n), draw(3 * n))
-        pa, pb, pc, pd = (draw(4 * n) for _ in range(4))
-        mask = (((pa + pb) % 5 != 0) & ((pc + pd) % 5 != 0)).float()
-        la = 0.5 * torch.log(d2(pa, pb).clamp_min(1e-12))
-        lb = 0.5 * torch.log(d2(pc, pd).clamp_min(1e-12))
-        with torch.no_grad():
-            sign = torch.sign(log_dx(pc, pd) - log_dx(pa, pb))
-        l_ord = (mask * torch.relu(sign * (la - lb) + 0.1)).sum() / mask.sum()
-        ramp = min(1.0, (it + 1) / (0.05 * steps))
-        loss = l_attr + 15 * l_rep + ramp * (0.6 * (dg / (1 + dg)).mean() + 2 * l_ord)
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        opt.step()
-        sched.step()
-    return Y.detach().cpu().numpy()
-
-
 FIT = {
     **{f"FloDR (w={w})": _flodr(float(w)) for w in (0, 1, 2, 3)},
     "openTSNE": _opentsne,
@@ -522,7 +404,6 @@ FIT = {
     "PCUMAP": lambda X, seed, metric: pcumap(X, seed)[0],
     "SQuadMDS": _squadmds,
     "PCA-2": _pca2,
-    "Free layout (pca)": fit_free,
     # the regularisation strength of DREAMS, 0.15 its default
     "DREAMS": _dreams(0.15),
     **{f"DREAMS (lambda={v})": _dreams(v) for v in (0, 0.05, 0.3, 0.5, 0.8)},

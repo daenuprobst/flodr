@@ -69,10 +69,12 @@ The documentation is a Starlight site built from `docs/docs/*.md` and the signat
 
 ## Reproducing the paper
 
-`scripts/` holds one script per figure and table of the paper, named after it (`fig2.py`, `ed_table1.py`,
-`supp_fig1.py`, ...), and `scripts/common.py` with the data, the methods and the scores they share. Each script fits
-what it needs, caches it under `scripts/cache`, so scripts that share fits reuse them, and writes its figure or
-table to `scripts/out`.
+`scripts/` holds one script per figure and table of the paper, named after it (`fig2.py`, `table1.py`,
+`ed_table1.py`, `supp_table1.py`, ...), with `scripts/common.py` for the data, the methods and the scores they share
+and `scripts/openproblems.py` for the OpenProblems scores, shared in the same way. Each script fits what it needs,
+caches it under `scripts/cache`, so scripts that share fits reuse them, and writes its figure or table to
+`scripts/out`. The tests against unseen measurements (Fig. 5 and Supplementary Tables 4 and 5) are not among these
+scripts.
 
 ```bash
 uv sync --extra paper
@@ -81,6 +83,10 @@ uv run python scripts/fig2.py
 ```
 
 Raw data go into `data/` (or the folder named by `DATA`); the data availability statement of the paper lists the
-sources, and each script names the files it reads. Three tools need interpreters of their own, named by
-`PCUMAP_PYTHON` (Parametric UMAP: TensorFlow 2.15 with umap-learn 0.5.5), `DREAMS_PYTHON` (DREAMS: the authors'
-openTSNE fork) and `SCVI_PYTHON` (scvi-tools, for the zebrafish latent); the population-genetics test needs `plink2`.
+sources, and each script names the files it reads. Two tools need interpreters of their own, named by
+`PCUMAP_PYTHON` (Parametric UMAP: TensorFlow 2.15 with umap-learn 0.5.5) and `DREAMS_PYTHON` (DREAMS: the authors'
+openTSNE fork). The OpenProblems scripts (`fig1.py`, `table1.py`, `ed_table3.py`, `supp_table3.py`) read the published
+scores from `scripts/cache/openproblems` (or the folder named by `OPENPROBLEMS`) and run FloDR through the task
+where its scores are missing: version 2 with `viash`, Docker and a checkout of `task_dimensionality_reduction` in
+that folder, version 1 with a checkout of `openproblems` there and its Python 3.8 interpreter, named by
+`OPENPROBLEMS_PYTHON`.
