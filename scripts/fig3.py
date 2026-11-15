@@ -4,7 +4,7 @@ from flodr.viz import plot_frontier
 from common import ATLASES, BENCHMARKS, METHOD_STYLE, NAMES, NAMES_2L, OURS, RC
 from common import TEXT_W, letter, save, scores
 
-BASELINES = ["openTSNE", "UMAP", "TriMap", "PaCMAP", "LocalMAP", "UMATO"]
+BASELINES = ["openTSNE", "DREAMS", "UMAP", "TriMap", "PaCMAP", "LocalMAP", "UMATO"]
 BASELINES += ["ParamRepulsor", "PHATE", "PyMDE", "PCUMAP", "SQuadMDS", "PCA-2"]
 # where the w labels sit, in points from their dot
 W_LABEL = {1: (5, -8, "top"), 2: (6, -2, "top"), 3: (5, 3, "bottom")}

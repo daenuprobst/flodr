@@ -1,4 +1,6 @@
-from fig2 import draw
+import fig2
 
-methods = ["TriMap", "PaCMAP", "LocalMAP", "PHATE", "PyMDE", "PCUMAP", "SQuadMDS"]
-draw(methods, "ed_fig4.pdf")
+# in eight columns a one-line "Parametric UMAP" runs into the next title
+fig2.TITLE["PCUMAP"] = "Parametric\nUMAP"
+methods = "DREAMS TriMap PaCMAP LocalMAP PHATE PyMDE PCUMAP SQuadMDS".split()
+fig2.draw(methods, "ed_fig4.pdf")

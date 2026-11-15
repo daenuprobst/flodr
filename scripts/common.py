@@ -254,7 +254,7 @@ def metric(ds, method=""):
     return (
         "jaccard"
         if ds == "drfp"
-        and method.split(" ")[0] in ("FloDR", "UMAP", "openTSNE", "Free")
+        and method.split(" ")[0] in ("FloDR", "UMAP", "openTSNE", "Free", "DREAMS")
         else "euclid"
     )
 
@@ -375,27 +375,34 @@ import json, sys, numpy as np
 import openTSNE.tsne as ot
 from openTSNE import TSNE
 from sklearn.decomposition import PCA
-f, seed = json.loads(sys.argv[1])
-# the tag passes X to an optimiser that no longer takes it
+f, seed, lam, metric, jobs = json.loads(sys.argv[1])
+# the tag passes X to an optimiser that does not take it
 call = ot.gradient_descent.__call__
 ot.gradient_descent.__call__ = lambda self, *a, X=None, **kw: call(self, *a, **kw)
 X = np.load(f)
 # start and target: the first two PCs, the first at sd 1e-4
 R = PCA(2, random_state=0).fit_transform(X.astype(np.float64))
 R = np.ascontiguousarray(R / R[:, 0].std() * 1e-4)
-kw = dict(regularization=True, reg_lambda=0.15, reg_embedding=R, n_jobs=8)
-Y = TSNE(initialization=R, random_state=seed, **kw).fit(X)
+kw = dict(regularization=True, reg_lambda=lam, reg_embedding=R, metric=metric)
+Y = TSNE(initialization=R, random_state=seed, n_jobs=jobs, **kw).fit(X)
 np.save(f, np.asarray(Y, np.float32))
 """
 
 
-def _dreams(X, seed, metric):
-    with tempfile.TemporaryDirectory() as tmp:
-        f = os.path.join(tmp, "X.npy")
-        np.save(f, X)
-        cmd = [DREAMS_PYTHON, "-c", _DREAMS, json.dumps([f, seed])]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
-        return np.load(f)
+def _dreams(lam):
+    def go(X, seed, metric):
+        metric = "jaccard" if metric == "jaccard" else "euclidean"
+        # below 10 000 points openTSNE runs Barnes-Hut, which is slower on many threads
+        jobs = 1 if len(X) < 10_000 else 8
+        with tempfile.TemporaryDirectory() as tmp:
+            f = os.path.join(tmp, "X.npy")
+            np.save(f, X)
+            args = json.dumps([f, seed, lam, metric, jobs])
+            cmd = [DREAMS_PYTHON, "-c", _DREAMS, args]
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
+            return np.load(f)
+
+    return go
 
 
 def _pca2(X, seed, metric):
@@ -516,7 +523,9 @@ FIT = {
     "SQuadMDS": _squadmds,
     "PCA-2": _pca2,
     "Free layout (pca)": fit_free,
-    "DREAMS": _dreams,
+    # the regularisation strength of DREAMS, 0.15 its default
+    "DREAMS": _dreams(0.15),
+    **{f"DREAMS (lambda={v})": _dreams(v) for v in (0, 0.05, 0.3, 0.5, 0.8)},
 }
 
 
