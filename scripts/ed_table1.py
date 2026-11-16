@@ -9,10 +9,16 @@ from scipy.stats import pearsonr, spearmanr
 from common import BENCHMARKS, CACHE, K, SEEDS, Scorer, cached, fit, knn, load
 from common import memo, metric, out
 
-LABEL = {"FloDR (w=2)": "FloDR, $w=2$", "FloDR (w=0)": "FloDR, $w=0$"}
-LABEL.update({"PCA-2": "PCA", "PCUMAP": r"Param.\ UMAP"})
-METHODS = ["FloDR (w=2)", "FloDR (w=0)", "UMAP", "openTSNE", "DREAMS", "PCA-2"]
-METHODS += ["TriMap", "PaCMAP", "LocalMAP", "PHATE", "PyMDE", "PCUMAP", "SQuadMDS"]
+LABEL = {"FloDR (w=2)": "FloDR, $w=2$", "FloDR fast": "FloDR, fast"}
+LABEL.update({"FloDR (w=0)": "FloDR, $w=0$", "PCA-2": "PCA", "PCUMAP": r"Param.\ UMAP"})
+# the arguments of each FloDR row, for the fit that compiles its training step
+WARM = {
+    "FloDR (w=2)": "w=2.0",
+    "FloDR fast": "w=2.0, fast=True",
+    "FloDR (w=0)": "w=0.0",
+}
+METHODS = ["FloDR (w=2)", "FloDR fast", "FloDR (w=0)", "UMAP", "openTSNE", "DREAMS"]
+METHODS += "PCA-2 TriMap PaCMAP LocalMAP PHATE PyMDE PCUMAP SQuadMDS".split()
 DATA = {
     "mnist": ("MNIST", "pixels"),
     "fmnist": ("Fashion-MNIST", "pixels"),
@@ -89,10 +95,9 @@ def clock(ds, m):
         # FloDR compiles its training step once per input width and keeps it on disk. The
         # timed fit finds it there, as every fit after a user's first does: a fit of 40
         # steps, in an interpreter of its own, comes first
-        w = float(m.split("=")[1].rstrip(")"))
         warm = (
             f"import common as c; from flodr import FloDR; X = c.load({ds!r})[0]; "
-            f"FloDR(w={w}, random_state=0, verbose=False, max_iter=40).fit(X)"
+            f"FloDR({WARM[m]}, random_state=0, verbose=False, max_iter=40).fit(X)"
         )
         subprocess.run([sys.executable, "-c", warm], **kw)
     run = subprocess.run([sys.executable, "-c", code], **kw)

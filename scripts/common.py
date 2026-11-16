@@ -205,11 +205,11 @@ def metric(ds, method=""):
     )
 
 
-def _flodr(w):
+def _flodr(w, **kw):
     def go(X, seed, metric):
         from flodr import FloDR
 
-        return FloDR(w=w, random_state=seed, verbose=False).fit(X).embedding_
+        return FloDR(w=w, random_state=seed, verbose=False, **kw).fit(X).embedding_
 
     return go
 
@@ -392,6 +392,8 @@ def _squadmds(X, seed, metric, n_iter=4000):
 
 FIT = {
     **{f"FloDR (w={w})": _flodr(float(w)) for w in (0, 1, 2, 3)},
+    # a quarter of the steps on two of the four couplings
+    "FloDR fast": _flodr(2.0, fast=True),
     "openTSNE": _opentsne,
     "UMAP": _umap,
     "TriMap": _trimap,
