@@ -2,8 +2,8 @@ from flodr import FloDR
 
 from common import BENCHMARKS, NAMES, SEEDS, fit, load, out, scores
 
-TITLE = {**NAMES, "paul15": "paul15 (scRNA-seq)", "drfp": "Schneider 50k (reactions)"}
-# each arm changes one setting of the released default
+TITLE = {**NAMES, "drfp": "Schneider50k"}
+# each arm changes one setting of the default
 ARMS = {
     "base": {},
     "$L=2$": {"n_layers": 2},
@@ -15,7 +15,7 @@ ARMS = {
     "800 steps": {"iters": 800},
 }
 
-lines = [r"Data set & Arm & recall@15 & CPD ($\rho$) \\", r"\midrule"]
+lines = [r"Data set & Arm & Recall & CPD \\", r"\midrule"]
 for ds in BENCHMARKS:
     if ds != BENCHMARKS[0]:
         lines.append(r"\midrule")
