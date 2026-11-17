@@ -154,6 +154,10 @@ class Coupling(torch.nn.Module):
             sketch_m[:, sketch_head:] = 0.0
 
         self.register_buffer("S", sketch_m)
+        # set only on the couplings of the density's tail, which read the map standardised by
+        # the training map, as a map has a scale of its own
+        self.register_buffer("in_loc", None)
+        self.register_buffer("in_scl", None)
         d_in = sketch if use_sketch else d
 
         act_cls = {"tanh": torch.nn.Tanh, "relu": torch.nn.ReLU, "silu": torch.nn.SiLU}[
@@ -186,6 +190,8 @@ class Coupling(torch.nn.Module):
         self.slim = bool(on)
 
     def _st(self, xm):
+        if getattr(self, "in_loc", None) is not None:
+            xm = (xm - self.in_loc) / self.in_scl
         inp = xm @ self.S.T if self.S is not None else xm
         net, rows = self.net, self.head_rows if self.slim else None
 
@@ -408,6 +414,10 @@ class CondBase(torch.nn.Module):
         self.n_scale = n_scale
         self.y_mu = torch.nn.Parameter(torch.zeros(k))
         self.y_logvar = torch.nn.Parameter(torch.zeros(k))
+        # the network reads y standardised by the training map, as a map has a scale of its own
+        # and raw positions saturate tanh
+        self.register_buffer("y_loc", torch.zeros(k))
+        self.register_buffer("y_scl", torch.ones(k))
 
         self.net = torch.nn.Sequential(
             torch.nn.Linear(k, hid),
@@ -429,8 +439,11 @@ class CondBase(torch.nn.Module):
             self.net[-1].weight.mul_(0.0)
             self.net[-1].bias.mul_(0.0)
 
+    def _yn(self, y):
+        return (y - self.y_loc) / self.y_scl if hasattr(self, "y_loc") else y
+
     def r_params(self, y):
-        out = self.net(y)
+        out = self.net(self._yn(y))
         m = self.m
 
         return out[:, :m], out[:, m : 2 * m].clamp(-8.0, 8.0)
@@ -439,7 +452,7 @@ class CondBase(torch.nn.Module):
         if not self.n_scale:
             return None
 
-        return torch.log_softmax(self.net(y)[:, 2 * self.m :], 1)
+        return torch.log_softmax(self.net(self._yn(y))[:, 2 * self.m :], 1)
 
     def sample_r(self, y, gen):
         mu, logvar = self.r_params(y)
@@ -668,6 +681,13 @@ class Flow(torch.nn.Module):
 
         tail.to(dev)
         cond = CondBase(d, cond_hid, k=k, n_scale=n_scale).to(dev)
+        with torch.no_grad():
+            y_loc, y_scl = z_main[:, :k].mean(0), z_main[:, :k].std(0).clamp_min(1e-6)
+            cond.y_loc.copy_(y_loc)
+            cond.y_scl.copy_(y_scl)
+            for layer in tail:
+                layer.in_loc = torch.cat([y_loc, torch.zeros(d - k, device=dev)])
+                layer.in_scl = torch.cat([y_scl, torch.ones(d - k, device=dev)])
         params = list(tail.parameters()) + list(cond.parameters())
 
         opt = torch.optim.Adam(
