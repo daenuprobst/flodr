@@ -6,10 +6,10 @@ title: Fitting
 model = FloDR(n_components=2, w=2.0, axes="variance", density=True, random_state=0).fit(X)
 ```
 
-`X` is an array or DataFrame, one row per point. FloDR whitens it with PCA (an exact bijection), builds the graph of
-the 15 nearest neighbours and trains the flow so that the first coordinates keep those neighbours, as in UMAP, and
-the order of distances between points, weighted by `w`. With `density=True` the density of the residual is fitted
-after the layout.
+`X` is an array or DataFrame, one row per point. FloDR whitens it with PCA (an exact bijection), builds UMAP's graph
+of the 15 nearest neighbours and trains the flow so that the first coordinates keep those neighbours, each edge set
+against random negatives of its ends, and the order of distances between points, weighted by `w`. With
+`density=True` the density of the residual is fitted after the layout.
 
 ![The same paul15 cells fitted with w = 0, the default and axes="heat"](../images/paul15_maps.png)
 

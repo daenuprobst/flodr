@@ -51,8 +51,8 @@ def test_off_leaves_no_trace():
     )
 
 
-# 200 steps on blobs: without the term the map bends inside the noise, rho(1) about 0.7 at the
-# median; with it about 0.1, every cell at or below 0.3
+# 200 steps on blobs: without the term the map bends inside the noise, rho(1) about 0.3 at the
+# median; with it about 0.04, every cell at or below 0.3
 @pytest.mark.parametrize(
     "lin",
     [{}, dict(lin_every=4, lin_batch=256, lin_h=(1.0,), lin_tau=0.5)],
@@ -62,5 +62,6 @@ def test_lowers_rho(lin):
     X = blobs(500, 40)
     base = fit(X, 200).faithful_scale(h=(1.0,), n_steps=4)
     on = fit(X, 200, w_lin=1.0, **lin).faithful_scale(h=(1.0,), n_steps=4)
-    assert base["rho_median"][0] > 0.4
+    assert base["rho_median"][0] > 0.2
+    assert on["rho_median"][0] < 0.5 * base["rho_median"][0]
     assert on["rho_median"][0] < 0.25 and (on["rho"][:, 0] <= 0.3).mean() > 0.9

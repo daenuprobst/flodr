@@ -484,9 +484,16 @@ class TrainConfig:
     neg: int = 12
     min_dist: float = 0.01
     w_rep: float = 5.0
+    # the local term: "infonce" sets each kNN edge against its endpoints' own negatives,
+    # whose push fades once a gap has opened; "umap" is attraction plus w_rep times
+    # repulsion on random pairs
+    local_mode: str = "infonce"
+    # the InfoNCE kernel 1 / (1 + d^(2 ince_b)); a heavier tail (smaller b) splits finer, a
+    # lighter one joins
+    ince_b: float = 0.95
     w_recon: float = 2.0
-    # mid-near attraction
-    w_global: float = 0.6
+    # mid-near attraction, off: at the starting scale its pull shrinks the InfoNCE layout
+    w_global: float = 0.0
     w_stress: float = 0.0
     # densMAP's density term: the correlation of each cell's log neighbour radius, input
     # vs layout; trades local recall for density preservation, so off by default
@@ -779,6 +786,9 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
         torch.from_numpy(stress_X).float().to(dev) if stress_X is not None else x_t
     )
 
+    if cfg.local_mode not in ("infonce", "umap"):
+        raise ValueError(f"local_mode must be infonce|umap, got {cfg.local_mode!r}")
+
     if cfg.stress_metric not in ("euclid", "jaccard"):
         raise ValueError(
             f"stress_metric must be euclid|jaccard, got {cfg.stress_metric!r}"
@@ -803,6 +813,35 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
         return 0.5 * torch.log(
             ((x_stress[row_a] - x_stress[row_b]) ** 2).sum(1).clamp_min(1e-12)
         )
+
+    def _local(Y, head, tail, w_edge, d2_edge, neg_a, neg_b, wts):
+        if cfg.local_mode == "umap":
+            if wts is None:
+                L_attr = -torch.log(w_edge + 1e-6).mean()
+            else:
+                L_attr = -(wts * torch.log(w_edge + 1e-6)).sum() / wts.sum()
+            d2_neg = ((Y[neg_a] - Y[neg_b]) ** 2).sum(1)
+            w_neg = 1.0 / (1.0 + a * (d2_neg + 1e-6) ** b)
+            return L_attr + cfg.w_rep * (-torch.log(1.0 - w_neg + 1e-6).mean())
+
+        # per edge and direction, -log w_ij + log(w_ij + sum_k w_ik) over the anchor's own
+        # cfg.neg negatives
+        Yf, m, ne = Y.float(), cfg.neg, head.shape[0]
+
+        def kern(d2):
+            return 1.0 / (1.0 + (d2 + 1e-6) ** cfg.ince_b)
+
+        def part(anchor, negs):
+            return kern(
+                ((Yf[anchor][:, None] - Yf[negs.view(ne, m)]) ** 2).sum(-1)
+            ).sum(1)
+
+        wf = kern(d2_edge.float())
+        per = -torch.log(wf + 1e-6) + 0.5 * (
+            torch.log(wf + part(head, neg_a) + 1e-6)
+            + torch.log(wf + part(tail, neg_b) + 1e-6)
+        )
+        return per.mean() if wts is None else (wts * per).sum() / wts.sum()
 
     if cfg.w_dens:
         w_e = (
@@ -850,16 +889,7 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
         d2_edge = ((Y[edge_i] - Y[edge_j]) ** 2).sum(1)
         w_edge = 1.0 / (1.0 + a * (d2_edge + 1e-6) ** b)
 
-        if w_attr is None:
-            L_attr = -torch.log(w_edge + 1e-6).mean()
-        else:
-            L_attr = -(w_attr * torch.log(w_edge + 1e-6)).sum() / w_attr.sum()
-
-        d2_neg = ((Y[neg_a] - Y[neg_b]) ** 2).sum(1)
-        w_neg = 1.0 / (1.0 + a * (d2_neg + 1e-6) ** b)
-        neg_loss = -torch.log(1.0 - w_neg + 1e-6)
-        L_rep = neg_loss.mean()
-        L_local = L_attr + cfg.w_rep * L_rep
+        L_local = _local(Y, edge_i, edge_j, w_edge, d2_edge, neg_a, neg_b, w_attr)
         d2_glob = ((Y[glob_a] - Y[glob_b]) ** 2).sum(1)
         L_glob = (d2_glob / (1.0 + d2_glob)).mean()
 
@@ -1001,15 +1031,9 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
         d2_edge = ((Y[inv[:n_edge]] - Y[inv[n_edge:]]) ** 2).sum(1)
         w_edge = 1.0 / (1.0 + a * (d2_edge + 1e-6) ** b)
 
-        if wa is None:
-            L_attr = -torch.log(w_edge + 1e-6).mean()
-        else:
-            L_attr = -(wa * torch.log(w_edge + 1e-6)).sum() / wa.sum()
-
-        d2_neg = ((Y[neg_a] - Y[neg_b]) ** 2).sum(1)
-        w_neg = 1.0 / (1.0 + a * (d2_neg + 1e-6) ** b)
-
-        L_rep = -torch.log(1.0 - w_neg + 1e-6).mean()
+        L_local = _local(
+            Y, inv[:n_edge], inv[n_edge:], w_edge, d2_edge, neg_a, neg_b, wa
+        )
 
         d2_glob = ((Y[glob_a] - Y[glob_b]) ** 2).sum(1)
         L_glob = (d2_glob / (1.0 + d2_glob)).mean()
@@ -1068,17 +1092,12 @@ def _train_flodr(Xp, ei, ej, cfg, rng, return_model, w, stress_X, progress, nois
         else:
             L_dens = 0.0
 
-        return (
-            L_attr
-            + cfg.w_rep * L_rep
-            + ramp
-            * (
-                cfg.w_recon * L_recon
-                + cfg.w_global * L_glob
-                + cfg.w_nll * L_nll
-                + cfg.w_stress * L_stress
-                + cfg.w_dens * L_dens
-            )
+        return L_local + ramp * (
+            cfg.w_recon * L_recon
+            + cfg.w_global * L_glob
+            + cfg.w_nll * L_nll
+            + cfg.w_stress * L_stress
+            + cfg.w_dens * L_dens
         )
 
     compiled_edges = cfg.compile_edges and dev.type == "cuda" and not cfg.w_recon
