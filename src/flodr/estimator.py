@@ -552,17 +552,24 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
 
         return self._forward(X)[:, : self.n_components].cpu().numpy()
 
+    # a map has a scale of its own, so the placement runs on the map shrunk until its median
+    # nearest-neighbour distance is 0.07, near that of the maps its kernel and step were set on
     def transform_opt(self, X, steps=200, lr=0.05):
+        from scipy.spatial import cKDTree
+
         check_is_fitted(self)
         X = validate_data(self, X, dtype=np.float32, order="C", reset=False)
+        c = 0.07 / float(
+            np.median(cKDTree(self.embedding_).query(self.embedding_, k=2)[0][:, 1])
+        )
         _, nn = knn_query(self._X, X, self._k, self._metric)
         a, b = find_ab(self._cfg.min_dist)
         dev = next(self.flow_.parameters()).device
-        Ytr = torch.from_numpy(np.ascontiguousarray(self.embedding_, np.float32)).to(
-            dev
-        )
+        Ytr = torch.from_numpy(
+            np.ascontiguousarray(self.embedding_ * c, np.float32)
+        ).to(dev)
         nn_t = torch.from_numpy(nn).to(dev)
-        y = self._forward(X)[:, : self.n_components].clone().requires_grad_(True)
+        y = (self._forward(X)[:, : self.n_components] * c).clone().requires_grad_(True)
         opt = torch.optim.Adam([y], lr=lr)
 
         def q(d2):
@@ -575,7 +582,7 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
             loss.backward()
             opt.step()
 
-        return y.detach().cpu().numpy()
+        return y.detach().cpu().numpy() / c
 
     # the full latent, layout first and then the residual; inverse_latent undoes it exactly
     def transform_latent(self, X):
