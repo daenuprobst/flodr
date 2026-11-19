@@ -77,9 +77,10 @@ def test_three_components():
     assert m.embedding_.shape == (N, 3) and np.isfinite(m.embedding_).all()
 
 
-# heat is an option: on the benchmarks it costs class-centroid structure (2026-10-07), so variance stays the default
-def test_variance_is_the_default():
-    assert FloDR().axes == "variance"
+# heat is an option, as on the benchmarks it costs class-centroid structure; the default is the
+# start fitted to the distance order
+def test_hinge_is_the_default():
+    assert FloDR().axes == "hinge"
 
 
 def test_rotation_is_orthogonal_and_aligned():

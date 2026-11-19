@@ -3,7 +3,7 @@ title: Fitting
 ---
 
 ```python
-model = FloDR(n_components=2, w=2.0, axes="variance", density=True, random_state=0).fit(X)
+model = FloDR(n_components=2, w=2.0, axes="hinge", density=True, random_state=0).fit(X)
 ```
 
 `X` is an array or DataFrame, one row per point. FloDR whitens it with PCA (an exact bijection), builds UMAP's graph
@@ -23,7 +23,7 @@ same recall@15 (0.27) the distance order lifts CPD, the rank correlation of inpu
 |---|---|---|
 | `n_components` | `2` | dimension of the map |
 | `w` | `2.0` | weight of the distance order; 0 keeps neighbourhoods only, larger values keep more global structure |
-| `axes` | `"variance"` | start from the leading principal components; `"heat"` starts from the heat geometry of the neighbour graph, which follows branches rather than variance |
+| `axes` | `"hinge"` | start from the plane that best keeps the input's distance order, fitted once with a fixed seed, so every seed starts alike; `"variance"` starts from the leading principal components, which are arbitrary on a whitened input; `"heat"` starts from the heat geometry of the neighbour graph, which follows branches rather than variance |
 | `density` | `True` | fit the density, needed by `score_samples` and the certificates |
 | `max_iter` | `None` | training steps, 6,400 by default; the step size scales with it |
 | `fast` | `False` | a quarter of the steps on two of the four coupling layers, see [Fast fits](#fast-fits) |

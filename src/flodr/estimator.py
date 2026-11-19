@@ -96,6 +96,104 @@ def _has_density(est):
     return True
 
 
+# the start plane: the linear map of the whitened head to 2-D that best keeps the input's
+# distance order, fitted on the ordinal hinge (margin 0.1) over pairs of pairs of
+# farthest-point landmarks, so rare regions weigh as much as dense ones, from the PCA plane
+# and n_try - 1 random ones. The plane with the lowest hinge on a fixed sample is completed
+# orthonormally, so the inverse stays exact; a whitened input has no leading plane, so a PCA
+# start alone is arbitrary
+def _hinge_rotation(
+    Z_head,
+    X,
+    seed,
+    device,
+    metric="euclid",
+    n_try=8,
+    landmarks=2000,
+    steps=400,
+    m=100_000,
+    margin=0.1,
+):
+    dev = torch.device(device)
+    Xt = torch.as_tensor(np.asarray(X, np.float32), device=dev)
+    n, h = Z_head.shape
+    g = torch.Generator(device=dev)
+    g.manual_seed(seed + 77)
+    rng = np.random.default_rng(seed + 77)
+    nl = min(landmarks, n // 5)
+    cur = int(torch.randint(0, n, (1,), device=dev, generator=g))
+    sel, dmin = [cur], torch.full((n,), float("inf"), device=dev)
+
+    for _ in range(nl - 1):
+        dmin = torch.minimum(dmin, ((Xt - Xt[cur]) ** 2).sum(1))
+        cur = int(dmin.argmax())
+        sel.append(cur)
+
+    # every pair is among the landmarks, so their input log distances are computed once, in
+    # the metric of the ordinal term (log Jaccard distance on binary inputs, as train._lh)
+    pool = torch.tensor(sel, device=dev)
+    Xp = Xt[pool]
+
+    if metric == "jaccard":
+        inter = Xp @ Xp.T
+        rs = Xp.sum(1)
+        union = (rs[:, None] + rs[None] - inter).clamp_min(1.0)
+        Lx = torch.log((1.0 - inter / union).clamp_min(1e-6))
+    else:
+        Lx = torch.stack(
+            [
+                0.5 * torch.log(((Xp - Xp[i]) ** 2).sum(1).clamp_min(1e-12))
+                for i in range(nl)
+            ]
+        )
+
+    del Xt, dmin
+    Zp = torch.as_tensor(np.asarray(Z_head, np.float32), device=dev)[pool]
+
+    def draw(size):
+        return [
+            torch.randint(0, nl, (size,), device=dev, generator=g) for _ in range(4)
+        ]
+
+    # differences before the projection, so the gradient is a matrix product and repeats bit
+    # for bit; the backward of a gather onto the few landmark rows sums in a varying order
+    def log_d(W, i, j):
+        return 0.5 * torch.log((((Zp[i] - Zp[j]) @ W) ** 2).sum(1).clamp_min(1e-12))
+
+    def hinge(W, a, b, c, d):
+        sign = torch.sign(Lx[c, d] - Lx[a, b])
+
+        return torch.relu(sign * (log_d(W, a, b) - log_d(W, c, d)) + margin).mean()
+
+    ev = draw(2 * m)
+    losses, planes = [], []
+
+    for t in range(n_try):
+        W0 = (
+            np.eye(h)[:, :2] if t == 0 else np.linalg.qr(rng.standard_normal((h, 2)))[0]
+        )
+        W = torch.tensor(W0, dtype=torch.float32, device=dev, requires_grad=True)
+        opt = torch.optim.Adam([W], lr=0.01)
+
+        for _ in range(steps):
+            loss = hinge(W, *draw(m))
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+
+        Q = np.linalg.qr(W.detach().cpu().numpy().astype(np.float64))[0]
+
+        with torch.no_grad():
+            Qt = torch.as_tensor(Q, dtype=torch.float32, device=dev)
+            losses.append(float(hinge(Qt, *ev)))
+
+        planes.append(Q)
+
+    R, _ = np.linalg.qr(np.c_[planes[int(np.argmin(losses))], np.eye(h)])
+
+    return R[:, :h].astype(np.float32)
+
+
 class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
     # fixed parts of the recipe, not user settings; farthest-point landmarks cover rare branches
     _FROZEN = dict(
@@ -121,7 +219,7 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
         device=None,
         verbose=True,
         advanced=None,
-        axes="variance",
+        axes="hinge",
     ):
         self.n_components = n_components
         self.w = w
@@ -182,8 +280,10 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
         if not (isinstance(self.w, numbers.Real) and self.w >= 0):
             raise ValueError(f"w must be a number >= 0, got {self.w!r}")
 
-        if self.axes not in ("variance", "heat"):
-            raise ValueError(f"axes must be 'variance' or 'heat', got {self.axes!r}")
+        if self.axes not in ("hinge", "variance", "heat"):
+            raise ValueError(
+                f"axes must be 'hinge', 'variance' or 'heat', got {self.axes!r}"
+            )
 
         if max_iter is not None and not (
             isinstance(max_iter, numbers.Integral) and max_iter >= 1
@@ -264,8 +364,9 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
         # below 16 points every other point is a neighbour
         self._k = min(self._FROZEN["n_neighbors"], len(X) - 1)
         self._cfg = self._config(X, self.max_iter)
+        # the hinge start depends on the data only, so its whitening and fit take seed 0
         Z, self._raw_of, self._coords_of = raw_coords(
-            X, self._FROZEN["pca_head"], self._seed
+            X, self._FROZEN["pca_head"], 0 if self.axes == "hinge" else self._seed
         )
 
         # noise columns widen the residual of narrow inputs; new points get zeros there and
@@ -319,6 +420,14 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
                 X,
             )
             R = heat_rotation(Z[:, : wh.n_head], P)
+            Z[:, : wh.n_head] = Z[:, : wh.n_head] @ R
+            rot = RotatedWhitening(wh, R)
+            self._raw_of, self._coords_of = rot.to_raw, rot.to_coords
+
+        if self.axes == "hinge" and isinstance(wh, Whitening):
+            R = _hinge_rotation(
+                Z[:, : wh.n_head], X, 0, self._device, metric=self._metric
+            )
             Z[:, : wh.n_head] = Z[:, : wh.n_head] @ R
             rot = RotatedWhitening(wh, R)
             self._raw_of, self._coords_of = rot.to_raw, rot.to_coords
