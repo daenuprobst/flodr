@@ -16,6 +16,9 @@ PROGENITOR = {
     "plant": ("Dividing", "dividing cells"),
 }
 LIM = (-0.03, 1.16)
+# the maps are framed on these percentiles: 1-99 leaves out 25 % of FloDR's stroma and 39 % of
+# UMAP's T/NK cells on the bone marrow
+CROP = (0.2, 99.8)
 
 
 def ranks(X):
@@ -58,7 +61,7 @@ def draw(atlas, name, ncol, legend_size=7.5):
     curves = {m: rnx(rp, ranks(Y[sub])) for m, Y in layouts.items()}
     axis = np.linalg.norm(P - P[labels == PROGENITOR[atlas][0]].mean(0), axis=1)
     lo, hi = np.percentile(axis, [1, 99])
-    kw = dict(cmap=common.cmap(common.SEQ), norm=Normalize(lo, hi), s=0.5)
+    kw = dict(cmap=common.cmap(common.SEQ), norm=Normalize(lo, hi), s=0.5, crop=CROP)
     pal = common.class_colours(labels)[1]
     uniq, counts = np.unique(labels, return_counts=True)
     order = uniq[np.argsort(-counts)]
@@ -81,7 +84,9 @@ def draw(atlas, name, ncol, legend_size=7.5):
     text(x0 + span / 2, H - 0.21, f"{common.NAMES[atlas]} ({len(P):,} cells)", size=9)
     for k, (m, Y) in enumerate(layouts.items()):
         ax = box(x0 + k * (top + 0.13), leg_y + 0.10, top, top)
-        plot_embedding(Y, labels, ax=ax, colours=pal, s=0.8).set_title(m, fontsize=9)
+        plot_embedding(Y, labels, ax=ax, colours=pal, s=0.8, crop=CROP).set_title(
+            m, fontsize=9
+        )
         common.letter(ax, "ab"[k])
     fig.legend(
         [Line2D([], [], marker="o", ls="", ms=4, color=pal[c]) for c in order],
