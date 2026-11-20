@@ -19,17 +19,18 @@ jobs:
           enable-cache: true
       - run: uv python install ${{ matrix.python }}
       # the lock resolves the CUDA wheels of torch; the runner has no GPU and the tests pin
-      # device="cpu", so torch comes from the CPU index instead
+      # device="cpu", so torch comes from the CPU index instead, and uv run --no-sync keeps it
+      # rather than reinstalling the locked one
       - name: Install with the dev extra and a CPU-only torch
         run: |
           uv sync --extra dev --no-install-package torch --python ${{ matrix.python }}
           uv pip install "torch>=2.1" --index-url https://download.pytorch.org/whl/cpu
       - name: Format
-        run: uv run black --check src tests scripts
+        run: uv run --no-sync black --check src tests scripts
       - name: Lint
-        run: uv run ruff check src tests
+        run: uv run --no-sync ruff check src tests
       - name: Tests
-        run: uv run pytest -q
+        run: uv run --no-sync pytest -q
 
   build:
     runs-on: ubuntu-latest
