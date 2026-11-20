@@ -1,7 +1,6 @@
 # The linearity term (smooth mode, opt-in) on the CPU. Off, the default, it leaves no trace in a
 # fit; on, it brings the decode deviation at the density's noise scale down, as faithful_scale
-# reads it. That the default fit is bitwise the frozen release's is checked against the
-# release's own source, which cannot be imported next to this one, outside the suite.
+# reads it.
 
 import numpy as np
 import pytest

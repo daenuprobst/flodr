@@ -595,7 +595,9 @@ def test_score_marginalises_the_padding():
     )
     assert m._n_pad == 18
     train, held = m.score_samples(X[:600]), m.score_samples(X[600:])
-    assert ks_2samp(train, held).pvalue > 0.05
+    # one fit is one draw of p: over five seeds and two torch builds it ranges from 0.04 to 0.72,
+    # with held-out cells scoring no lower than training ones
+    assert ks_2samp(train, held).pvalue > 0.01
     # the same draws for every point; only BLAS blocking moves the last bit with the batch
     np.testing.assert_allclose(held[:30], m.score_samples(X[600:630]), rtol=1e-6)
 
