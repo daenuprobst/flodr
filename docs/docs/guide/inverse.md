@@ -32,9 +32,9 @@ X_decoded = model.inverse_latent(Z)
 ![Two walks across the Fashion-MNIST map, decoded at nine steps](../images/fashion_paths.png)
 
 Two walks across the [Fashion-MNIST](../examples/fashion-mnist.md) map, each the shortest path through the graph of
-15 nearest neighbours on the map between the densest points of two classes, decoded at nine steps with the borrowed
-residual. Where no training image is near (dashed on the map) the decoded images are faded: there the map has
-nothing to decode from.
+15 nearest neighbours on the map between the densest points of two classes, decoded at nine steps by `decode`.
+Where no training image is near (dashed on the map) the decoded images are faded: there the map has nothing to
+decode from.
 
 Many inputs share a position. With the density, `flodr.conformal.sample_fibre(model, Y, n_draws=64)` draws them
 exactly from p(x | y), and `flodr.conformal.conformal_bands(model, X_calib, Y)` gives split-conformal bands of the

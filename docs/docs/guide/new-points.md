@@ -13,8 +13,8 @@ keeps more neighbours and costs more time (`steps=200`, `lr=0.05`).
 
 ![10,000 Fashion-MNIST test images placed by transform and by transform_opt](../images/fashion_new_points.png)
 
-The 10,000 [Fashion-MNIST](../examples/fashion-mnist.md) test images placed by `transform` (4 ms on a GPU) and by
-`transform_opt` (2.8 s), over the 60,000 training images (grey). For 77% and 83% of them most of their 15 nearest
+The 10,000 [Fashion-MNIST](../examples/fashion-mnist.md) test images placed by `transform` (9 ms on a GPU) and by
+`transform_opt` (3.3 s), over the 60,000 training images (grey). For 77% and 82% of them most of their 15 nearest
 training images on the map are of their own class.
 
 On padded inputs (fewer than 30 columns) the training points carry noise in the padding and new points do not, so

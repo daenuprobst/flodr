@@ -70,7 +70,9 @@ for ax, (name, kw) in zip(axes, fits.items()):
     recall, cpd = scores(X[train], m.embedding_)
     print(f"{name}: recall {recall:.3f}, CPD {cpd:.3f}")
     text = f"recall@15 {recall:.3f}\nCPD {cpd:.3f}"
-    viz.plot_embedding(m.embedding_, types[train], ax=ax, colours=pal, s=6, text=text)
+    # framed wide enough for the small DC and Eos clusters at the edge of the map
+    kw = dict(colours=pal, s=6, text=text, crop=(0.2, 99.8))
+    viz.plot_embedding(m.embedding_, types[train], ax=ax, **kw)
     ax.set_title(name)
 handles = [
     Line2D([], [], ls="", marker="o", ms=5, c=c, label=t) for t, c in pal.items()

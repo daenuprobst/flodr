@@ -36,4 +36,4 @@ uv sync --extra dev
 uv run pytest
 ```
 
-The tests run on the CPU and take a few minutes.
+The tests run on the CPU, a few also on the GPU when there is one, and take about twenty minutes.

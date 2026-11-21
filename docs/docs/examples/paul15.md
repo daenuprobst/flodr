@@ -9,15 +9,15 @@ python examples/paul15.py
 
 [`examples/paul15.py`](https://github.com/daenuprobst/flodr/blob/main/examples/paul15.py) fits FloDR to 2,184 of the
 2,730 mouse bone marrow progenitors of Paul et al. (2015), as the 50 principal components of the 1,000 most variable
-genes, and keeps the other 546 to calibrate and test. It loads the data through scanpy and takes about a minute and a
-half with a GPU.
+genes, and keeps the other 546 to calibrate and test. It loads the data through scanpy and takes a few minutes with
+a GPU.
 
 ```
-w = 0: recall 0.274, CPD 0.558
-w = 2 (default): recall 0.270, CPD 0.795
-w = 2, axes="heat": recall 0.271, CPD 0.788
+w = 0: recall 0.278, CPD 0.577
+w = 2 (default): recall 0.274, CPD 0.831
+w = 2, axes="heat": recall 0.274, CPD 0.816
 coverage certificate: undecided
-FloDR label: level 0.010 nats (1% of what the profile recovers), global p 0.03 (certified), ...
+FloDR label: level 0.008 nats (1% of what the profile recovers), global p 0.01 (certified), ...
 PCA label: level 0.130 nats (11% of what the profile recovers), global p 0.01 (certified), ...
 ```
 

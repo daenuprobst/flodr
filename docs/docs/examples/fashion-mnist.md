@@ -12,15 +12,15 @@ to the 60,000 Fashion-MNIST training images, as 50 standardised principal compon
 about four minutes with a GPU.
 
 ```
-transform: 10000 images in 4 ms, 76.8% agree
-transform_opt: 10000 images in 2757 ms, 82.7% agree
-log density median -77.1, coverage: certified
+transform: 10000 images in 9 ms, 77.1% agree
+transform_opt: 10000 images in 3289 ms, 82.2% agree
+log density median -81.8, coverage: refused
 ```
 
 ![60,000 Fashion-MNIST images on a FloDR map, and images decoded on a grid over it](../images/fashion_map.png)
 
-The map, and images decoded on a grid over it with the residual of the training images nearest each grid point
-([the inverse](../guide/inverse.md)). Each image takes the colour of the class nearest it.
+The map, and images decoded on a grid over it by `decode` ([the inverse](../guide/inverse.md)). Each image takes
+the colour of the class nearest it.
 
 ![10,000 Fashion-MNIST test images placed by transform and by transform_opt](../images/fashion_new_points.png)
 

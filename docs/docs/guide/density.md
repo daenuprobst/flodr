@@ -13,7 +13,7 @@ law of the data, so test it on points the model has not seen.
 ![Fashion-MNIST test images coloured by their log density, with the most and the least likely](../images/fashion_density.png)
 
 The 10,000 Fashion-MNIST test images coloured by `score_samples`, with the 12 most and the 12 least likely. Trousers
-and sneakers are the most likely, dark or patterned tops and jackets the least.
+and sneakers are the most likely, dark garments and bags the least.
 
 ## Certificates
 
@@ -54,5 +54,5 @@ or a function. `viz.plot_band` draws them along a path.
 ![Four genes decoded along two lineages of paul15](../images/paul15_paths.png)
 
 Four genes decoded along the erythroid and the neutrophil lineage of [paul15](../examples/paul15.md): the 90%
-conformal band, the mean of 256 exact draws from p(x | y) and the mean of the 30 nearest cells. Gata1 and Hba-a2 rise
-towards the erythrocytes, Mpo and Elane towards the neutrophils.
+conformal band, the mean of 256 exact draws from p(x | y) and the mean of the 30 nearest cells. Hba-a2 rises towards
+the erythrocytes and Elane towards the neutrophils, Gata1 and Mpo less.

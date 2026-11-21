@@ -49,7 +49,7 @@ viz.plot_audit(res, axes=ax[2], show_labels=False)
 | `axes` | `"hinge"` | start from the plane that best keeps the input's distance order, the same for every seed; `"variance"` from the leading principal components, or `"heat"` from the heat geometry of the neighbour graph |
 | `density` | `True` | fit the density, needed by `score_samples` and the certificates |
 | `max_iter` | `None` | training steps, 6,400 by default |
-| `fast` | `False` | a quarter of the steps on two of the four coupling layers: about six times faster, fewer neighbours kept on large data |
+| `fast` | `False` | a quarter of the steps on two of the four coupling layers: about four times faster on large data, with fewer neighbours kept there |
 | `random_state` | `0` | seed |
 | `device` | `None` | the GPU when there is one |
 

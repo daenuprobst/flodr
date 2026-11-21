@@ -31,7 +31,6 @@ X = ((P - mean) / sd).astype(np.float32)
 
 model = FloDR(random_state=0).fit(X[train])
 Y = model.embedding_
-latent = model.transform_latent(X[train])
 tree = cKDTree(Y)
 pal = viz.palette(labels)
 handles = [
@@ -42,12 +41,11 @@ plt.rcParams.update(viz.RC)
 
 
 def decode(positions):
-    # each position with the residual of the 15 training images nearest it on the map
-    nn = tree.query(positions, k=15)[1]
-    Z = latent[nn].mean(1)
-    Z[:, :2] = positions
-    x = pca.inverse_transform(model.inverse_latent(Z) * sd + mean)
-    return np.clip(x / 255, 0, 1).reshape(-1, 28, 28), labels[train][nn[:, 0]]
+    # each position from the 15 training images nearest it on the map, and the class of the
+    # nearest
+    x = pca.inverse_transform(model.decode(positions) * sd + mean)
+    nearest = tree.query(positions)[1]
+    return np.clip(x / 255, 0, 1).reshape(-1, 28, 28), labels[train][nearest]
 
 
 def tile(ax, img, xy, half, colour, alpha=1.0):
