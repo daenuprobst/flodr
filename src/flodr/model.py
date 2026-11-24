@@ -155,7 +155,7 @@ class Coupling(torch.nn.Module):
 
         self.register_buffer("S", sketch_m)
         # set only on the couplings of the density's tail, which read the map standardised by
-        # the training map, as a map has a scale of its own
+        # the mean and sd of the training map
         self.register_buffer("in_loc", None)
         self.register_buffer("in_scl", None)
         d_in = sketch if use_sketch else d

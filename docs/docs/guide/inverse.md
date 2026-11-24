@@ -15,7 +15,7 @@ position; the zero of the residual has no meaning of its own.
 
 `decode` takes the mean of the 15 fitted points nearest a position on the map and moves it onto the fibre of the
 position: to a nearby input that the map places exactly there. On held-out points it is as accurate as that mean
-and as a decoder trained on the layout, and it needs neither.
+and as a decoder trained on the layout, without training one.
 
 By hand, with the residual of the same points instead, which is less accurate on large data sets:
 

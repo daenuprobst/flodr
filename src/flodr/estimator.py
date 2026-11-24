@@ -552,7 +552,7 @@ class FloDR(ClassNamePrefixFeaturesOutMixin, TransformerMixin, BaseEstimator):
 
         return self._forward(X)[:, : self.n_components].cpu().numpy()
 
-    # a map has a scale of its own, so the placement runs on the map shrunk until its median
+    # maps differ in scale, so the placement runs on the map shrunk until its median
     # nearest-neighbour distance is 0.07, near that of the maps its kernel and step were set on
     def transform_opt(self, X, steps=200, lr=0.05):
         from scipy.spatial import cKDTree
